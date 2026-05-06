@@ -1,0 +1,11 @@
+gspread==6.1.2
+google-auth==2.29.0
+python-dotenv==1.0.1
+pandas
+langgraph==0.2.16
+langchain-groq==0.1.5
+transformers==4.46.3
+torch==2.10.0
+sentencepiece
+protobuf
+python-telegram-bot
