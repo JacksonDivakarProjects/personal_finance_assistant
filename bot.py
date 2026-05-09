@@ -72,7 +72,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "**Examples:**\n"
         "- `How much did I spend on Rent?`\n"
         "- `Add ₹500 for Grocery on May 10th`\n"
-        "- `Update Commute budget to ₹600`\n\n"
         "Just send me a message.",
         parse_mode="Markdown"
     )

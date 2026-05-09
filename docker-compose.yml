@@ -1,0 +1,9 @@
+services:
+  finance-bot:
+    build: .
+    image: jackdiva/finance-bot:latest
+    container_name: finance-bot
+    restart: unless-stopped
+    volumes:
+      - ./.env:/app/.env
+      - ./account.json:/app/account.json

@@ -11,9 +11,11 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive"
 ]
 
+
+ACCOUNT_FILE = os.getenv("ACCOUNT_FILE")
 # Load credentials and client
 def get_gsheet_client():
-    creds = Credentials.from_service_account_file("account.json", scopes=SCOPES)
+    creds = Credentials.from_service_account_file(ACCOUNT_FILE, scopes=SCOPES)
     return gspread.authorize(creds)
 
 SHEET_URL = os.getenv("sheet_url")
