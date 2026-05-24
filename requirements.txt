@@ -1,0 +1,11 @@
+gspread==6.1.2
+google-auth==2.29.0
+python-dotenv==1.0.1
+pandas==2.2.2
+langgraph==0.2.16
+langchain-groq==0.1.5
+python-telegram-bot==20.7
+# BUG FIX #21: Flask was listed without a version pin, meaning any future
+# major version could be installed and silently break the app.  Pinned to
+# the stable 3.x series that is compatible with the rest of the stack.
+Flask==3.0.3
