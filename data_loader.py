@@ -98,7 +98,22 @@ def load_budget(sheet_client, sheet_name):
     )
     df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce')
     df = df.dropna(subset=['Amount'])
-    return df.set_index('Category')['Amount'].to_dict()
+
+    # FIX (issue #12): set_index().to_dict() silently keeps the LAST row for a
+    # duplicated category, inconsistent with load_item_category's issue #4 fix
+    # (which keeps the first and logs the duplicate). Apply the same rule here
+    # so a repeated category row in the Budget sheet doesn't silently clobber
+    # an earlier budget figure with no warning.
+    import logging
+    logger = logging.getLogger(__name__)
+    budget = {}
+    for cat, amt in zip(df['Category'], df['Amount']):
+        if cat in budget:
+            logger.debug("Duplicate budget category ignored: '%s' -> %s (keeping %s)",
+                         cat, amt, budget[cat])
+        else:
+            budget[cat] = amt
+    return budget
 
 
 def get_actual_spending(expense_df, item_to_cat):
@@ -112,13 +127,22 @@ def get_actual_spending(expense_df, item_to_cat):
     # an empty Category column in the sheet are excluded from actual spend even
     # if they're mapped in item_to_cat.
     # Fix: replace '' with NaN first, then fillna from the item→category mapping.
+    #
+    # FIX (issue #11): item_to_cat.get()/dict.map() lookups are case-sensitive,
+    # but every other lookup in this app (_item_already_mapped, the fuzzy
+    # matcher) treats item names case-insensitively. An expense logged as
+    # "coffee" would fail to match a mapping keyed "Coffee", leaving Category
+    # as NaN and getting silently dropped by dropna() below — understating
+    # total spend with no error or warning. Build a lowercase-keyed lookup so
+    # the mapping matches regardless of case.
+    item_to_cat_lower = {str(k).lower(): v for k, v in item_to_cat.items()}
     if 'Category' in expense_df.columns:
         expense_df['Category'] = expense_df['Category'].replace('', pd.NA)
         expense_df['Category'] = expense_df['Category'].fillna(
-            expense_df['Item'].map(item_to_cat)
+            expense_df['Item'].str.lower().map(item_to_cat_lower)
         )
     else:
-        expense_df['Category'] = expense_df['Item'].map(item_to_cat)
+        expense_df['Category'] = expense_df['Item'].str.lower().map(item_to_cat_lower)
 
     expense_df = expense_df.dropna(subset=['Category'])
     actual = expense_df.groupby('Category')['Amount (₹)'].sum().to_dict()

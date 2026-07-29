@@ -127,13 +127,34 @@ def _extract_json(text: str) -> Optional[dict]:
     Use a simple brace-depth scanner instead: walk the string, count open/close
     braces, and extract exactly the substring from the first `{` to its matching
     closing `}`.  This is O(n) and handles nested braces correctly.
+
+    FIX (issue #13): the depth scanner above still counted braces found INSIDE
+    a JSON string value. Braces that happen to be balanced within a string
+    (like the docstring's own "buy {items}" example) work by coincidence, but
+    an unbalanced brace in a string value — e.g. {"notes": "cost is }100"} —
+    made the scanner think the object closed early, producing a truncated,
+    invalid JSON fragment. Track whether we're inside a quoted string (and
+    whether the current character is escaped) so braces inside strings are
+    ignored, matching how a real JSON parser reads structure.
     """
     start = text.find('{')
     if start == -1:
         return None
     depth = 0
+    in_string = False
+    escaped = False
     for i, ch in enumerate(text[start:], start):
-        if ch == '{':
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == '\\':
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == '{':
             depth += 1
         elif ch == '}':
             depth -= 1
@@ -368,9 +389,16 @@ def execute_write(state: AgentState) -> AgentState:  # noqa: C901
         suggested    = pending.get("suggested", "")
         cat_response = user_answer.strip()
 
-        if cat_response.lower().startswith('y'):
+        # FIX (issue #10): `.startswith('y')`/`.startswith('n')` misfired for
+        # any real category name beginning with those letters (e.g. "Yoga",
+        # "News", "Nutrition") — the user's typed category was silently
+        # discarded and treated as a yes/no answer. Only exact y/yes/n/no
+        # tokens (case-insensitive) count as confirmation; anything else is
+        # taken literally as the category name.
+        cat_response_lower = cat_response.lower()
+        if cat_response_lower in ("y", "yes"):
             category = suggested
-        elif cat_response.lower().startswith('n'):
+        elif cat_response_lower in ("n", "no"):
             state["pending_question"] = f"📂 Type the category name for '{item}':"
             state["pending_state"] = {
                 "step": "newcat", "parsed": parsed,
