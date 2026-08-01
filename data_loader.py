@@ -13,19 +13,55 @@ def load_expense_journal(sheet_client):
     # in the sheet header row don't cause KeyError on 'Item' or 'Amount (₹)'.
     headers = [h.strip() for h in headers]
 
-    rows = [row[:8] for row in all_data[1:]]
+    # FIX (issue #37): gspread/Sheets TRIMS trailing blank cells per row -- it
+    # does not pad every row out to a uniform width. Any row whose rightmost
+    # populated column falls short of H (Notes) -- which is the NORMAL shape
+    # for any row with no note, or for the A:E-succeeded/H-failed partial
+    # write scenario -- comes back shorter than len(headers). Building a
+    # DataFrame straight from ragged rows raises
+    # ValueError("N columns passed, passed data had M columns") the moment
+    # every currently-loaded row shares the same short width (e.g. a small or
+    # freshly-created sheet), which crashes bot.py's startup with no guard.
+    # Pad every row to len(headers) explicitly instead of trusting all rows
+    # to already be that wide.
+    rows = [row[:8] + [''] * (len(headers) - len(row[:8])) for row in all_data[1:]]
     df = pd.DataFrame(rows, columns=headers)
 
-    df = df[df['Item'].str.strip() != '']
+    # FIX (issue #33): only a throwaway .str.strip() was used to FILTER blank
+    # rows here -- the stripped value was never reassigned back to df['Item'],
+    # so "Coffee " / " coffee" (whitespace variants) survived as distinct
+    # values. Every downstream case-insensitive lookup (_resolve_categories'
+    # .str.lower().map(...)) only lowercases, never strips, so a whitespace
+    # variant silently failed to match its category mapping and vanished from
+    # totals with no warning. Strip it into the actual column, not just the
+    # filter condition.
+    df['Item'] = df['Item'].str.strip()
+    df = df[df['Item'] != '']
 
-    df['Amount (₹)'] = (
+    raw_amount = (
         df['Amount (₹)']
         .astype(str)
         .str.replace('₹', '', regex=False)
         .str.replace(',', '', regex=False)
         .str.strip()
     )
-    df['Amount (₹)'] = pd.to_numeric(df['Amount (₹)'], errors='coerce')
+    df['Amount (₹)'] = pd.to_numeric(raw_amount, errors='coerce')
+
+    # FIX (issue #34): a malformed Amount cell (a stale "#REF!"/"#N/A" formula
+    # error, a stray "/-" suffix, a space-thousands typo) silently vanishes via
+    # dropna with zero trace -- nobody would notice without hand-totaling the
+    # raw sheet. Log which rows are being dropped and the RAW string that
+    # failed to parse (captured before to_numeric overwrote it with NaN), so
+    # at least it's visible in the logs.
+    unparsed_mask = df['Amount (₹)'].isna()
+    if unparsed_mask.any():
+        import logging
+        logger = logging.getLogger(__name__)
+        for item, raw in zip(df.loc[unparsed_mask, 'Item'], raw_amount[unparsed_mask]):
+            logger.warning(
+                "Dropping Expense Journal row with unparseable Amount for item '%s': %r",
+                item, raw,
+            )
     df = df.dropna(subset=['Amount (₹)'])
     return df
 
@@ -96,16 +132,31 @@ def load_budget(sheet_client, sheet_name):
     df['Category'] = df['Category'].str.strip()
 
     df = df[df['Category'] != '']
-    df = df[df['Category'] != 'Total']
+    # FIX (issue #35): this was an exact-case match -- a "TOTAL" or "total"
+    # row (any casing other than exactly "Total") wasn't filtered and became
+    # a phantom budget category with whatever number was in that row.
+    df = df[df['Category'].str.lower() != 'total']
 
-    df['Amount'] = (
+    raw_amount = (
         df['Amount']
         .astype(str)
         .str.replace('₹', '', regex=False)
         .str.replace(',', '', regex=False)
         .str.strip()
     )
-    df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce')
+    df['Amount'] = pd.to_numeric(raw_amount, errors='coerce')
+
+    # FIX (issue #34): same "silently dropped with zero trace" gap as
+    # load_expense_journal -- log the raw string that failed to parse.
+    unparsed_mask = df['Amount'].isna()
+    if unparsed_mask.any():
+        import logging
+        logger = logging.getLogger(__name__)
+        for cat, raw in zip(df.loc[unparsed_mask, 'Category'], raw_amount[unparsed_mask]):
+            logger.warning(
+                "Dropping %s row with unparseable Amount for category '%s': %r",
+                sheet_name, cat, raw,
+            )
     df = df.dropna(subset=['Amount'])
 
     # FIX (issue #12): set_index().to_dict() silently keeps the LAST row for a
@@ -137,11 +188,8 @@ def load_summary_table(sheet_client):
     uncategorized expense rows) and the "Grand Total" row are skipped; the
     same first-wins duplicate rule as load_budget/load_item_category applies.
 
-    Deliberately does NOT attempt to read the sheet's Income/Gap/Remaining
-    side panel (columns further right, e.g. col I in practice) — that panel's
-    position isn't tied to the pivot's header/row structure the way this
-    Category/Amount pair is, so parsing it by fixed row offsets would be
-    guessing at a layout rather than reading a real table.
+    The sheet's Income/Gap/Remaining side panel is a separate, differently
+    shaped layout and is read by `load_summary_panel` below instead.
     """
     all_data = sheet_client.get_all_values("Summary Table")
     if len(all_data) < 2:
@@ -179,6 +227,59 @@ def load_summary_table(sheet_client):
         else:
             summary[cat] = amt
     return summary
+
+
+def load_summary_panel(sheet_client):
+    """
+    Load the "Summary Table" sheet's Income/Gap/Remaining side panel into a
+    dict, e.g. {"Expense": 26000.0, "Income": 40000.0, "Gap": 14000.0,
+    "Remaining (At Hand)": 14000.0}.
+
+    Unlike load_summary_table's Category/Amount pivot (a proper header +
+    fixed 2-column table), this panel is four label/value pairs scattered in
+    a side column next to the pivot — observed at column index 8 in
+    practice, but not guaranteed to stay there, and with each value one row
+    directly below its label rather than beside it. There's no header row
+    and no fixed row range to slice.
+
+    Hardcoding row numbers for this would silently break the moment the
+    pivot table's own row count changes (adding a category pushes everything
+    below it down). Instead, scan every cell for one of the known labels and
+    read the value from the SAME column, one row below wherever that label
+    is actually found — this only depends on the label-then-value-below
+    shape holding, not on any absolute position.
+
+    A label that's missing or whose value fails to parse is logged and left
+    out of the returned dict rather than raising, since this feeds a
+    best-effort query answer, not a write path.
+    """
+    KNOWN_LABELS = ("Expense", "Income", "Gap", "Remaining (At Hand)")
+
+    import logging
+    logger = logging.getLogger(__name__)
+
+    all_data = sheet_client.get_all_values("Summary Table")
+    panel = {}
+    for i, row in enumerate(all_data):
+        for j, cell in enumerate(row):
+            label = str(cell).strip()
+            if label not in KNOWN_LABELS or label in panel:
+                continue
+            if i + 1 >= len(all_data) or j >= len(all_data[i + 1]):
+                logger.warning("Summary Table label '%s' found at row %d but no value row below it", label, i)
+                continue
+            raw = str(all_data[i + 1][j]).strip()
+            cleaned = raw.replace('₹', '').replace(',', '').strip()
+            try:
+                panel[label] = float(cleaned)
+            except ValueError:
+                logger.warning("Summary Table label '%s' has unparseable value %r", label, raw)
+
+    for label in KNOWN_LABELS:
+        if label not in panel:
+            logger.debug("Summary Table label '%s' not found", label)
+
+    return panel
 
 
 def _resolve_categories(expense_df, item_to_cat):

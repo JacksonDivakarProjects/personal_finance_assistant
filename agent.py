@@ -10,7 +10,8 @@ from langgraph.graph import StateGraph, END
 from langchain_groq import ChatGroq
 from config import GROQ_API_KEY, MODEL_NAME
 from data_loader import (
-    load_expense_journal, load_item_category, load_budget, load_summary_table,
+    load_expense_journal, load_item_category, load_budget,
+    load_summary_table, load_summary_panel,
     get_actual_spending, get_expense_records,
 )
 from data_writer import DataWriter
@@ -33,6 +34,29 @@ class AgentState(TypedDict):
     final_answer: str
     pending_question: Optional[str]
     pending_state: Optional[Dict]
+
+
+def merge_actual_into_budget(actual_spend: dict, budget_dict: dict) -> None:
+    """
+    Ensure every category in actual_spend has a budget entry, in place.
+
+    FIX (issue #36): category strings aren't case-normalized between the
+    "Category Budget" sheet (typed freely by a human) and the "Item &
+    Category" sheet (the source of actual_spend's category keys, often
+    written by the bot via .title()). A category like "car repair" vs "Car
+    Repair" means the exact `cat not in budget_dict` check used to never
+    merge them -- silently splitting one real category into two: a
+    zero-actual "car repair" budget row and a zero-budget "Car Repair"
+    actual-spend row, each looking wrong in a different direction. Try a
+    case-insensitive match before defaulting to 0.0. Shared by agent.py and
+    bot.py so both startup paths apply the exact same rule instead of two
+    independent copies silently drifting apart (the same failure shape this
+    whole fix is closing).
+    """
+    budget_lower = {str(k).lower(): v for k, v in budget_dict.items()}
+    for cat in actual_spend:
+        if cat not in budget_dict:
+            budget_dict[cat] = budget_lower.get(str(cat).lower(), 0.0)
 
 
 # ── Data refresh ──────────────────────────────────────────────────────────────
@@ -58,15 +82,15 @@ def _refresh_data_context(data_context: dict) -> None:
         item_to_cat   = load_item_category(sheet_client)
         budget_dict   = load_budget(sheet_client, "Category Budget")
         summary_table = load_summary_table(sheet_client)
+        summary_panel = load_summary_panel(sheet_client)
         actual_spend, total_actual = get_actual_spending(expense_df, item_to_cat)
         # FIX (issue #27): "Next Month Budget" fallback removed — that
         # worksheet no longer exists in the spreadsheet.
-        for cat in actual_spend:
-            if cat not in budget_dict:
-                budget_dict[cat] = 0.0
+        merge_actual_into_budget(actual_spend, budget_dict)
         data_context["actual"]        = actual_spend
         data_context["budget"]        = budget_dict
         data_context["summary_table"] = summary_table
+        data_context["summary_panel"] = summary_panel
         data_context["total_actual"]  = total_actual
         data_context["expense_df"]    = expense_df
         data_context["item_to_cat"]   = item_to_cat
@@ -723,6 +747,7 @@ def answer_query_node(state: AgentState) -> AgentState:
     budget        = state["data_context"].get("budget", {})
     total         = state["data_context"].get("total_actual", 0.0)
     summary_table = state["data_context"].get("summary_table", {})
+    summary_panel = state["data_context"].get("summary_panel", {})
     expense_df    = state["data_context"].get("expense_df")
     item_to_cat   = state["data_context"].get("item_to_cat", {})
 
@@ -746,6 +771,17 @@ def answer_query_node(state: AgentState) -> AgentState:
         for cat in sorted(summary_table.keys()):
             lines.append(f"  {cat}: ₹{summary_table[cat]:.2f}")
         lines.append(f"  Summary Table Grand Total: ₹{sum(summary_table.values()):.2f}")
+
+    # Income / Gap / Remaining-at-hand, from the Summary Table sheet's side
+    # panel (load_summary_panel). This is the only source in the whole app
+    # for income and remaining-cash figures — nothing else tracks income at
+    # all — so questions like "what's my income" or "how much do I have
+    # left" can only be answered from this block.
+    if summary_panel:
+        lines.append("\nIncome / Gap / Remaining (from the Summary Table sheet's side panel):")
+        for label in ("Income", "Expense", "Gap", "Remaining (At Hand)"):
+            if label in summary_panel:
+                lines.append(f"  {label}: ₹{summary_panel[label]:.2f}")
 
     # Record-wise, time-attached data from the Expense Journal, so the LLM
     # can answer time-scoped questions ("last week", "yesterday", "this
@@ -775,6 +811,9 @@ def answer_query_node(state: AgentState) -> AgentState:
         "Expense Journal row, the latter is the sheet's own pivot and may lag by "
         "one refresh; only reference the Summary Table block specifically if the "
         "user asks about it directly, or the two disagree and that's worth noting. "
+        "For questions about income, the gap between income and spending, or how "
+        "much money is remaining/left/at hand, use the Income/Gap/Remaining block — "
+        "no other data here covers income. "
         "The individual records list below it is what you should filter/sum over "
         "yourself for any question scoped to a specific time period (e.g. "
         "'last week', 'yesterday', 'this month').\n"

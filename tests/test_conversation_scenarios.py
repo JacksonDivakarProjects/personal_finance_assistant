@@ -677,5 +677,25 @@ class TestCancelAndValidation(unittest.TestCase):
         return result, scripted
 
 
+# ── 14. Category-case merge between actual spend and budget (issue #36) ──────
+
+class TestCategoryCaseMerge(unittest.TestCase):
+    def test_case_variant_category_merges_instead_of_splitting(self):
+        """FIX (issue #36): "car repair" (Category Budget) vs "Car Repair"
+        (Item & Category, bot-written via .title()) must merge into one
+        category in the actual-vs-budget view, not silently split into two."""
+        actual_spend = {"Car Repair": 2000.0}
+        budget_dict = {"car repair": 5000.0}
+        agent.merge_actual_into_budget(actual_spend, budget_dict)
+        self.assertEqual(budget_dict["Car Repair"], 5000.0,
+                          "the actual-spend category must see the real budget, not default to 0")
+
+    def test_no_matching_budget_still_defaults_to_zero(self):
+        actual_spend = {"Totally New Category": 100.0}
+        budget_dict = {"Groceries": 5000.0}
+        agent.merge_actual_into_budget(actual_spend, budget_dict)
+        self.assertEqual(budget_dict["Totally New Category"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -10,10 +10,10 @@ load_dotenv()
 from sheet_client import SheetClient
 from data_loader import (
     load_expense_journal, load_item_category, load_budget,
-    load_summary_table, get_actual_spending,
+    load_summary_table, load_summary_panel, get_actual_spending,
 )
 from data_writer import DataWriter
-from agent import build_graph, AgentState
+from agent import build_graph, AgentState, merge_actual_into_budget
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -35,25 +35,52 @@ if not TELEGRAM_TOKEN:
 # ----------------------------------------------------------------------
 sheet_client = SheetClient()
 
-expense_df    = load_expense_journal(sheet_client)
-item_to_cat   = load_item_category(sheet_client)
-budget_dict   = load_budget(sheet_client, "Category Budget")
-summary_table = load_summary_table(sheet_client)
-
-actual_spend, total_actual = get_actual_spending(expense_df, item_to_cat)
+# FIX (issues #37, #38): none of these load_* calls had any exception
+# handling, and this whole block runs at MODULE IMPORT TIME with no guard in
+# main.py either -- a ragged Expense Journal row (issue #37), a transient
+# Sheets API error (rate limit), a renamed/deleted worksheet, or a duplicate
+# header row used to crash the entire process before the Telegram handlers
+# were even registered, causing a crash-loop under Docker/Render that never
+# recovers if the underlying cause persists. Start in a degraded (empty) data
+# state instead -- the bot still comes up and can answer/write once a user
+# message triggers the next _refresh_data_context call, which has always
+# been guarded (agent.py) and will pick up real data as soon as the
+# underlying issue clears.
+try:
+    expense_df    = load_expense_journal(sheet_client)
+    item_to_cat   = load_item_category(sheet_client)
+    budget_dict   = load_budget(sheet_client, "Category Budget")
+    summary_table = load_summary_table(sheet_client)
+    summary_panel = load_summary_panel(sheet_client)
+    actual_spend, total_actual = get_actual_spending(expense_df, item_to_cat)
+except Exception:
+    logger.exception(
+        "Failed to load initial data from Google Sheets at startup -- "
+        "starting in a degraded state (no data) instead of crashing the "
+        "whole process. Will recover automatically once a message triggers "
+        "a successful refresh."
+    )
+    expense_df    = None
+    item_to_cat   = {}
+    budget_dict   = {}
+    summary_table = {}
+    summary_panel = {}
+    actual_spend, total_actual = {}, 0.0
 
 # FIX (issue #27): "Next Month Budget" fallback removed — that worksheet no
 # longer exists in the spreadsheet. A category with no "Category Budget" row
 # now just defaults to 0.0 budgeted, same as before for any category missing
 # from both sheets.
-for cat in actual_spend:
-    if cat not in budget_dict:
-        budget_dict[cat] = 0.0
+# FIX (issue #36): use the shared helper (agent.py) so this startup path and
+# _refresh_data_context's mid-session refresh apply the exact same
+# case-insensitive merge rule instead of two copies that can drift apart.
+merge_actual_into_budget(actual_spend, budget_dict)
 
 data_context = {
     "actual":        actual_spend,
     "budget":        budget_dict,
     "summary_table": summary_table,
+    "summary_panel": summary_panel,
     "total_actual":  total_actual,
     "expense_df":    expense_df,
     "item_to_cat":   item_to_cat,
