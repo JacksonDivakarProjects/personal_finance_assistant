@@ -395,10 +395,21 @@ def execute_write(state: AgentState) -> AgentState:  # noqa: C901
         # discarded and treated as a yes/no answer. Only exact y/yes/n/no
         # tokens (case-insensitive) count as confirmation; anything else is
         # taken literally as the category name.
-        cat_response_lower = cat_response.lower()
-        if cat_response_lower in ("y", "yes"):
+        #
+        # FIX (issue #22): the exact-token check above was too narrow — casual
+        # replies like "yeah", "yep", "Yes!", "y." fell through to the `else`
+        # branch and got saved as the literal category name (e.g. category
+        # "Yeah"), which then permanently mis-categorizes that item on every
+        # future expense via `_item_already_mapped`. Strip trailing punctuation
+        # and match against a small affirmative/negative token set instead of
+        # a fixed 4-token list, while still leaving a typed category name
+        # (e.g. "Yoga") to fall through to the `else` branch as before.
+        cat_response_lower = cat_response.lower().rstrip(" .!?")
+        AFFIRMATIVE = {"y", "yes", "yeah", "yep", "ya", "sure", "ok", "okay"}
+        NEGATIVE    = {"n", "no", "nope", "nah"}
+        if cat_response_lower in AFFIRMATIVE:
             category = suggested
-        elif cat_response_lower in ("n", "no"):
+        elif cat_response_lower in NEGATIVE:
             state["pending_question"] = f"📂 Type the category name for '{item}':"
             state["pending_state"] = {
                 "step": "newcat", "parsed": parsed,

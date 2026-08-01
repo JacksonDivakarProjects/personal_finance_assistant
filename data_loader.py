@@ -38,6 +38,15 @@ def load_item_category(sheet_client):
     duplicate item names, keeping only the last one.  Instead, build the
     dict manually so the FIRST mapping wins (preserving original intent)
     and duplicates are visible in the log.
+
+    FIX (issue #23): this used to dedupe into a lowercase-keyed `mapping`
+    dict internally, then discard it and rebuild an exact-case-keyed
+    `result` as the actual return value — so case-variant duplicates like
+    "Coffee" and "COFFEE" survived as two separate entries, each able to map
+    to a *different* category. Every case-insensitive lookup elsewhere
+    (`_item_already_mapped`, `get_actual_spending`'s `item_to_cat_lower`)
+    then had to silently collapse them again, non-deterministically, with no
+    logging. Return the already-deduped lowercase mapping directly instead.
     """
     records = sheet_client.get_worksheet("Item & Category").get_all_records()
     if not records:
@@ -65,16 +74,7 @@ def load_item_category(sheet_client):
         else:
             mapping[key] = cat_raw   # store lowercase key, original-case value
 
-    # Return {original-case item: category} using first occurrence of each item
-    result = {}
-    for _, row in df.iterrows():
-        item_raw = str(row['Item name']).strip()
-        cat_raw  = str(row['Category']).strip()
-        if not item_raw or not cat_raw:
-            continue
-        if item_raw not in result:
-            result[item_raw] = cat_raw
-    return result
+    return mapping
 
 
 def load_budget(sheet_client, sheet_name):
@@ -86,8 +86,17 @@ def load_budget(sheet_client, sheet_name):
     rows = [row[:2] for row in all_data[1:]]
     df = pd.DataFrame(rows, columns=headers)
 
-    df = df[df['Category'].str.strip() != '']
-    df = df[df['Category'].str.strip() != 'Total']
+    # FIX (issue #24): the dedupe loop below keys directly on df['Category'],
+    # but this column was never stripped of leading/trailing whitespace (only
+    # checked with a throwaway .str.strip() in the filters, not reassigned) —
+    # a stray trailing-space cell (e.g. "Groceries ") survived as a distinct
+    # key from "Groceries", so it dodged the dedupe rule and could sit
+    # invisibly under a whitespace-suffixed key that the rest of the app
+    # (whose category strings ARE stripped) never matches against.
+    df['Category'] = df['Category'].str.strip()
+
+    df = df[df['Category'] != '']
+    df = df[df['Category'] != 'Total']
 
     df['Amount'] = (
         df['Amount']
