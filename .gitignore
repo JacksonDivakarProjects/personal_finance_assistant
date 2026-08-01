@@ -5,6 +5,11 @@ account.json
 .*
 CLAUDE.md
 
+# Runtime state (issue #42's PicklePersistence file and its Docker volume
+# mount) -- local/container state, not source.
+/data/
+bot_persistence.pickle
+
 # Keep the subagents/skills built for this project under version control —
 # the ".*" pattern above would otherwise exclude them along with real dotfiles.
 !.claude/

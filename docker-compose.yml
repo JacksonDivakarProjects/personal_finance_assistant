@@ -7,3 +7,8 @@ services:
     volumes:
       - ./.env:/app/.env
       - ./account.json:/app/account.json
+      # FIX (issue #42): persist pending_state (PicklePersistence) across
+      # container restarts instead of the ephemeral container filesystem.
+      - ./data:/app/data
+    environment:
+      - PERSISTENCE_FILE=/app/data/bot_persistence.pickle

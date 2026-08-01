@@ -2,7 +2,9 @@
 import os
 import logging
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, filters, ContextTypes, PicklePersistence,
+)
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -184,9 +186,26 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ----------------------------------------------------------------------
 # 4. Main
 # ----------------------------------------------------------------------
+# FIX (issue #42): context.user_data was purely in-memory -- a bot restart
+# mid-conversation (deploy, crash-and-restart, host reboot) silently erased
+# any pending_state, so the user's in-progress entry vanished with zero
+# indication it ever existed. PicklePersistence durably saves user_data to
+# disk and reloads it on the next start, so a restart no longer drops an
+# in-progress write. PERSISTENCE_FILE is overridable so Docker can point it
+# at a mounted volume (see docker-compose.yml) instead of the container's
+# ephemeral filesystem.
+PERSISTENCE_FILE = os.getenv("PERSISTENCE_FILE", "bot_persistence.pickle")
+
+
 def main():
     """Start the Telegram bot."""
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    persistence = PicklePersistence(filepath=PERSISTENCE_FILE)
+    application = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .persistence(persistence)
+        .build()
+    )
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_error_handler(error_handler)

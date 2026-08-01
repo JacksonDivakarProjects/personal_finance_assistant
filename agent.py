@@ -1,6 +1,7 @@
 # agent.py
 
 import json
+import os
 import re
 import difflib
 import logging
@@ -155,9 +156,17 @@ def _extract_amount(text: str) -> Optional[float]:
     "1,500" / "12,00,000" are read as single numbers; a comma that instead
     separates two different numbers in the message ("500, 200 for food")
     still resolves correctly since a space remains between the two groups.
+
+    FIX (issue #44): the regex used to have no sign handling at all, so
+    "-500" silently became +500 here -- while a negative amount extracted
+    directly from the LLM's JSON (a different code path) was preserved
+    unchanged and written with no validation. Same conceptual input
+    ("log a negative amount"), two different, both-wrong outcomes depending
+    on which path parsed it. Now preserves the sign so ALL paths reach
+    execute_write's single negative-amount check (issue #44) uniformly.
     """
-    m = re.search(r'\b(\d+(?:\.\d+)?)\b', text.replace(',', ''))
-    return float(m.group(1)) if m else None
+    m = re.search(r'-?\d+(?:\.\d+)?', text.replace(',', ''))
+    return float(m.group(0)) if m else None
 
 
 def _extract_json(text: str) -> Optional[dict]:
@@ -242,6 +251,17 @@ def _classify_intent_rule_based(state: AgentState) -> AgentState:
         return state
 
     if re.search(r'\b\d+\s*(rs|rupees|₹)\b', text, re.IGNORECASE):
+        state["intent"] = "write"
+        return state
+
+    # FIX (issue #43): a plain expense report with no write verb and no
+    # currency suffix -- "500 for groceries today", "300 milk" -- used to
+    # fall through to the default "query" here, silently never getting
+    # logged whenever this fallback (not the primary LLM path) happens to be
+    # active. No query_indicator matched either (checked above), so a bare
+    # number at this point is a much stronger write signal than a query
+    # signal -- broaden the fallback instead of leaving it undetected.
+    if re.search(r'\d', text):
         state["intent"] = "write"
         return state
 
@@ -533,25 +553,6 @@ def execute_write(state: AgentState) -> AgentState:  # noqa: C901
     if not user_notes:
         user_notes = f"Added on {now.strftime('%Y-%m-%d %H:%M')}"
 
-    # FIX (issue #39): nothing validated day/month/year formed a real
-    # calendar date -- month=13, day=45/Feb 30, etc. were written to the
-    # sheet verbatim (even echoed back in the success message). Since
-    # get_expense_records parses these via pd.to_datetime(errors='coerce')
-    # and drops unparseable dates, a bad date used to silently disappear from
-    # time-scoped query answers while still counting in all-time totals from
-    # get_actual_spending -- an inconsistency invisible until someone asks a
-    # time-scoped question. Reject before ever reaching a write.
-    try:
-        datetime(year, month, day)
-    except ValueError:
-        state["final_answer"] = (
-            f"❌ {day}/{month}/{year} isn't a real date. Please start over with a valid date, "
-            f"e.g. 'add {item} {amount if amount else 150} on 15/6/2026'."
-        )
-        state["pending_question"] = None
-        state["pending_state"]    = None
-        return state
-
     # ── Retry step: a previous write attempt failed, re-attempt it verbatim ─
     if step == "retry_write":
         category      = pending.get("category", "")
@@ -602,6 +603,45 @@ def execute_write(state: AgentState) -> AgentState:  # noqa: C901
             return state
         amount = parsed_amount
         # falls through to shared category block below
+
+    # FIX (issue #44): negative amounts used to be handled inconsistently --
+    # silently sign-stripped in the OLD amount-step regex but preserved
+    # unchecked when extracted straight from the LLM's JSON, with no
+    # confirmation either way that a negative ledger entry was intended.
+    # This bot has no refund/reversal concept, so the policy is simple:
+    # negative amounts aren't a supported expense and are rejected outright,
+    # consistently, regardless of which path produced them. Positioned AFTER
+    # Step 2 (not right after "Resolve fields") because Step 2 reassigns
+    # `amount` from the user's typed reply -- checking any earlier would
+    # validate the stale pre-reply value instead of what was actually typed.
+    # (amount == 0 is NOT rejected here -- it's the deliberate sentinel
+    # meaning "not yet provided", handled by the "ask for amount" step above.)
+    if amount < 0:
+        state["final_answer"] = (
+            f"❌ Amount can't be negative (got {amount:.2f}). Please start over with a positive amount."
+        )
+        state["pending_question"] = None
+        state["pending_state"]    = None
+        return state
+
+    # FIX (issue #39): nothing validated day/month/year formed a real
+    # calendar date -- month=13, day=45/Feb 30, etc. were written to the
+    # sheet verbatim (even echoed back in the success message). Since
+    # get_expense_records parses these via pd.to_datetime(errors='coerce')
+    # and drops unparseable dates, a bad date used to silently disappear from
+    # time-scoped query answers while still counting in all-time totals from
+    # get_actual_spending -- an inconsistency invisible until someone asks a
+    # time-scoped question. Reject before ever reaching a write.
+    try:
+        datetime(year, month, day)
+    except ValueError:
+        state["final_answer"] = (
+            f"❌ {day}/{month}/{year} isn't a real date. Please start over with a valid date, "
+            f"e.g. 'add {item} {amount if amount else 150} on 15/6/2026'."
+        )
+        state["pending_question"] = None
+        state["pending_state"]    = None
+        return state
 
     # ── Shared block: have item + amount, resolve category ─────────────────
     if step in (None, "amount"):
@@ -730,8 +770,19 @@ def execute_write(state: AgentState) -> AgentState:  # noqa: C901
     return state
 
 
+# FIX (issue #45): no upper-bound/plausibility check existed anywhere on
+# amount -- a fat-finger extra zero ("150000" instead of "1500") was written
+# straight to the ledger with no confirmation, the single most common real
+# data-entry mistake. A hard block would need per-user/per-category spend
+# history to set a sane threshold without false-positiving on genuinely large
+# but real expenses (rent, tuition); a soft warning appended to the success
+# message needs no such history and still surfaces the "did you mean to add
+# an extra zero?" prompt for a human to catch, without blocking the write.
+LARGE_AMOUNT_WARNING_THRESHOLD = float(os.getenv("LARGE_AMOUNT_WARNING_THRESHOLD", "100000"))
+
+
 def _success_msg(item, amount, category, notes, day, month, year) -> str:
-    return (
+    msg = (
         f"✅ Added expense:\n"
         f"📦 Item: {item}\n"
         f"💰 Amount: ₹{amount:.2f}\n"
@@ -739,6 +790,9 @@ def _success_msg(item, amount, category, notes, day, month, year) -> str:
         f"📝 Note: {notes}\n"
         f"📅 Date: {day}/{month}/{year}"
     )
+    if amount >= LARGE_AMOUNT_WARNING_THRESHOLD:
+        msg += f"\n⚠️ That's a large amount (₹{amount:.2f}) — double check it's correct, not a typo."
+    return msg
 
 
 # ── Query answering ───────────────────────────────────────────────────────────

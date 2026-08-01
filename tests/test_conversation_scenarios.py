@@ -740,5 +740,132 @@ class TestInvalidDateRejected(unittest.TestCase):
         self.assertNotIn("isn't a real date", result["final_answer"])
 
 
+# ── 16. F/G formula-column invariant must never be written (protective) ──────
+
+class TestFormulaColumnsNeverWritten(unittest.TestCase):
+    def test_add_expense_only_ever_writes_A_to_E_and_column_H(self):
+        """
+        Protective regression test (no known live bug): data_writer.py's
+        add_expense currently only ever writes A{row}:E{row} and cell
+        (row, 8) -- columns F/G hold sheet-side formulas (per CLAUDE.md) and
+        must never be touched by application code. A future "simplify these
+        two calls into one A{n}:H{n} write" edit would silently convert live
+        formulas into static values with no warning. This test exists so
+        that regression breaks a test instead of silently shipping.
+        """
+        sheet_client, writer, _, run_agent = build_env(
+            item_category_rows=[["Item name", "Category"], ["Coffee", "Food And Grocery"]]
+        )
+        scripted = ScriptedLLM([
+            '{"intent":"write","operation":"add_expense","item":"Coffee","amount":50,'
+            '"day":1,"month":8,"year":2026,"notes":"test"}'
+        ])
+        with patch.object(agent, "llm", scripted):
+            run_agent(make_state("add coffee 50"))
+
+        self.assertEqual(len(writer.add_expense_calls), 1)
+        self.assertEqual(len(sheet_client.update_calls), 1)
+        sheet_name, range_notation, values, _ = sheet_client.update_calls[0]
+        self.assertEqual(sheet_name, "Expense Journal")
+        self.assertRegex(range_notation, r'^A\d+:E\d+$',
+                          "must write exactly columns A-E, never touching F/G")
+        self.assertEqual(len(values[0]), 5, "must write exactly 5 values (A-E), not more")
+
+        self.assertEqual(len(sheet_client.worksheet_update_cell_calls), 1)
+        _, _, col, _ = sheet_client.worksheet_update_cell_calls[0]
+        self.assertEqual(col, 8, "notes must be written to column H (8), never F/G")
+
+
+# ── 17. Rule-based fallback classifier catches verb-less expense reports ─────
+
+class TestRuleBasedFallbackBroadened(unittest.TestCase):
+    def test_plain_numeric_expense_reports_classify_as_write(self):
+        """FIX (issue #43): "500 for groceries today" / "300 milk" have no
+        write_keyword and no rs/rupees/₹ suffix -- must not silently default
+        to query in the LLM-unavailable fallback path."""
+        for text in ["500 for groceries today", "300 milk", "paid 450 electrician"]:
+            state = {"user_query": text}
+            agent._classify_intent_rule_based(state)
+            self.assertEqual(state["intent"], "write", f"{text!r} should classify as write")
+
+    def test_query_indicators_still_win_over_bare_numbers(self):
+        state = {"user_query": "how much did I spend on food in the last 30 days"}
+        agent._classify_intent_rule_based(state)
+        self.assertEqual(state["intent"], "query")
+
+
+# ── 18. Negative amounts rejected consistently everywhere (issue #44) ────────
+
+class TestNegativeAmountRejected(unittest.TestCase):
+    def test_negative_amount_from_llm_extraction_is_rejected(self):
+        _, writer, _, run_agent = build_env()
+        scripted = ScriptedLLM([
+            '{"intent":"write","operation":"add_expense","item":"Rent","amount":-500,'
+            '"day":1,"month":8,"year":2026,"notes":""}'
+        ])
+        with patch.object(agent, "llm", scripted):
+            result = run_agent(make_state("spent -500 refund on rent"))
+
+        self.assertEqual(len(writer.add_expense_calls), 0, "must not write a negative amount")
+        self.assertIn("can't be negative", result["final_answer"])
+
+    def test_negative_amount_at_amount_step_is_rejected_not_sign_stripped(self):
+        """FIX (issue #44): "-500" used to silently become +500 at the amount
+        step -- must now be rejected instead of guessing the user meant positive."""
+        _, writer, _, run_agent = build_env()
+        r1, _ = self._add_via_llm(run_agent, "add mango 0", "Mango", 0)
+        pending = r1["pending_state"]
+        self.assertEqual(pending["step"], "amount")
+
+        with patch.object(agent, "llm", ScriptedLLM([])):
+            r2 = run_agent(make_state("-500", pending_state=pending))
+
+        self.assertEqual(len(writer.add_expense_calls), 0)
+        self.assertIn("can't be negative", r2["final_answer"])
+
+    def _add_via_llm(self, run_agent, message, item, amount):
+        now = datetime.now()
+        llm_json = (
+            f'{{"intent":"write","operation":"add_expense","item":"{item}","amount":{amount},'
+            f'"day":{now.day},"month":{now.month},"year":{now.year},"notes":""}}'
+        )
+        scripted = ScriptedLLM([llm_json])
+        with patch.object(agent, "llm", scripted):
+            result = run_agent(make_state(message))
+        return result, scripted
+
+
+# ── 19. Soft warning for unusually large amounts (issue #45) ─────────────────
+
+class TestLargeAmountSoftWarning(unittest.TestCase):
+    def test_large_amount_gets_warning_but_still_writes(self):
+        _, writer, _, run_agent = build_env(
+            item_category_rows=[["Item name", "Category"], ["Rent", "Bills"]]
+        )
+        scripted = ScriptedLLM([
+            '{"intent":"write","operation":"add_expense","item":"Rent","amount":150000,'
+            '"day":1,"month":8,"year":2026,"notes":""}'
+        ])
+        with patch.object(agent, "llm", scripted):
+            result = run_agent(make_state("add rent 150000"))
+
+        self.assertEqual(len(writer.add_expense_calls), 1, "must still write -- this is a warning, not a block")
+        self.assertIn("large amount", result["final_answer"])
+
+    def test_ordinary_amount_gets_no_warning(self):
+        _, writer, _, run_agent = build_env(
+            item_category_rows=[["Item name", "Category"], ["Coffee", "Food And Grocery"]]
+        )
+        scripted = ScriptedLLM([
+            '{"intent":"write","operation":"add_expense","item":"Coffee","amount":150,'
+            '"day":1,"month":8,"year":2026,"notes":""}'
+        ])
+        with patch.object(agent, "llm", scripted):
+            result = run_agent(make_state("add coffee 150"))
+
+        self.assertEqual(len(writer.add_expense_calls), 1)
+        self.assertNotIn("large amount", result["final_answer"])
+
+
 if __name__ == "__main__":
     unittest.main()
