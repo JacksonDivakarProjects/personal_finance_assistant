@@ -794,34 +794,59 @@ class TestRuleBasedFallbackBroadened(unittest.TestCase):
         self.assertEqual(state["intent"], "query")
 
 
-# ── 18. Negative amounts rejected consistently everywhere (issue #44) ────────
+# ── 18. Negative amounts are a supported credit/income entry (issue #46) ─────
 
-class TestNegativeAmountRejected(unittest.TestCase):
-    def test_negative_amount_from_llm_extraction_is_rejected(self):
-        _, writer, _, run_agent = build_env()
+class TestNegativeAmountAllowed(unittest.TestCase):
+    def test_negative_amount_from_llm_extraction_is_written_as_a_credit(self):
+        """FIX (issue #46): negative amounts are a deliberate feature -- the
+        user logs credits (dividends, money received back) this way, not
+        just expenses. Must write, not reject."""
+        _, writer, _, run_agent = build_env(
+            item_category_rows=[["Item name", "Category"], ["Dividend", "Income"]]
+        )
         scripted = ScriptedLLM([
-            '{"intent":"write","operation":"add_expense","item":"Rent","amount":-500,'
+            '{"intent":"write","operation":"add_expense","item":"Dividend","amount":-500,'
             '"day":1,"month":8,"year":2026,"notes":""}'
         ])
         with patch.object(agent, "llm", scripted):
-            result = run_agent(make_state("spent -500 refund on rent"))
+            result = run_agent(make_state("dividend -500"))
 
-        self.assertEqual(len(writer.add_expense_calls), 0, "must not write a negative amount")
-        self.assertIn("can't be negative", result["final_answer"])
+        self.assertEqual(len(writer.add_expense_calls), 1)
+        self.assertEqual(writer.add_expense_calls[0]["amount"], -500.0)
+        self.assertIn("Credit", result["final_answer"])
+        self.assertIn("-₹500.00", result["final_answer"])
 
-    def test_negative_amount_at_amount_step_is_rejected_not_sign_stripped(self):
-        """FIX (issue #44): "-500" used to silently become +500 at the amount
-        step -- must now be rejected instead of guessing the user meant positive."""
-        _, writer, _, run_agent = build_env()
-        r1, _ = self._add_via_llm(run_agent, "add mango 0", "Mango", 0)
+    def test_negative_amount_at_amount_step_reply_is_preserved_not_sign_stripped(self):
+        """FIX (issue #44/#46): "-500" used to silently become +500 at the
+        amount-step reply -- the sign must now be preserved and written."""
+        _, writer, _, run_agent = build_env(
+            item_category_rows=[["Item name", "Category"], ["Refund", "Income"]]
+        )
+        r1, _ = self._add_via_llm(run_agent, "add refund 0", "Refund", 0)
         pending = r1["pending_state"]
         self.assertEqual(pending["step"], "amount")
 
         with patch.object(agent, "llm", ScriptedLLM([])):
             r2 = run_agent(make_state("-500", pending_state=pending))
 
-        self.assertEqual(len(writer.add_expense_calls), 0)
-        self.assertIn("can't be negative", r2["final_answer"])
+        self.assertEqual(len(writer.add_expense_calls), 1)
+        self.assertEqual(writer.add_expense_calls[0]["amount"], -500.0)
+
+    def test_large_negative_amount_still_gets_warning(self):
+        """FIX (issue #45/#46): the large-amount warning checks magnitude, so
+        a big credit ("-150000") warns just like a big expense would."""
+        _, writer, _, run_agent = build_env(
+            item_category_rows=[["Item name", "Category"], ["Dividend", "Income"]]
+        )
+        scripted = ScriptedLLM([
+            '{"intent":"write","operation":"add_expense","item":"Dividend","amount":-150000,'
+            '"day":1,"month":8,"year":2026,"notes":""}'
+        ])
+        with patch.object(agent, "llm", scripted):
+            result = run_agent(make_state("dividend -150000"))
+
+        self.assertEqual(len(writer.add_expense_calls), 1)
+        self.assertIn("large amount", result["final_answer"])
 
     def _add_via_llm(self, run_agent, message, item, amount):
         now = datetime.now()

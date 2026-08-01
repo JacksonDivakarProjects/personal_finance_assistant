@@ -157,13 +157,16 @@ def _extract_amount(text: str) -> Optional[float]:
     separates two different numbers in the message ("500, 200 for food")
     still resolves correctly since a space remains between the two groups.
 
-    FIX (issue #44): the regex used to have no sign handling at all, so
-    "-500" silently became +500 here -- while a negative amount extracted
-    directly from the LLM's JSON (a different code path) was preserved
-    unchanged and written with no validation. Same conceptual input
-    ("log a negative amount"), two different, both-wrong outcomes depending
-    on which path parsed it. Now preserves the sign so ALL paths reach
-    execute_write's single negative-amount check (issue #44) uniformly.
+    FIX (issue #44, revised #46): the regex used to have no sign handling at
+    all, so "-500" silently became +500 here, while a negative amount
+    extracted directly from the LLM's JSON (a different code path) was
+    preserved unchanged. Same conceptual input, two different outcomes
+    depending on which path parsed it. Negative amounts are a deliberate,
+    supported entry (the user logs credits/income this way -- dividends,
+    money received back from a friend -- not just expenses), so preserving
+    the sign consistently here means "-500" typed at the amount-step reply
+    is now honored the same way as a negative amount from the LLM path,
+    instead of silently being turned positive.
     """
     m = re.search(r'-?\d+(?:\.\d+)?', text.replace(',', ''))
     return float(m.group(0)) if m else None
@@ -283,21 +286,36 @@ def _classify_and_extract_via_llm(user_query: str) -> Optional[dict]:
     rule-based classifier without special-casing failure modes.
     """
     now = datetime.now()
+    # FIX (issue #46): the user logs credits (dividends, refunds, money a
+    # friend paid back) as negative entries in the same expense ledger, not
+    # just money spent -- the prompt used to only describe expenses, so a
+    # message like "got a dividend of 500 from stocks" would have been
+    # extracted as a POSITIVE amount (a real expense misread as spend, wrong
+    # sign, wrong net total), even though execute_write itself now happily
+    # accepts negative amounts. Extraction has to know to flip the sign for
+    # money received, or allowing negative amounts downstream doesn't help
+    # for anything but a literally typed minus sign.
     prompt = (
         'You are the intent classifier for a personal finance Telegram bot. '
         'Classify the user message and return ONLY valid JSON.\n\n'
         '"query" = the user is asking about their spending/budget/history '
         '(e.g. "how much did I spend on X", "what\'s left for rent", "show my budget").\n'
-        '"write" = the user is reporting a new expense they made, to be logged '
-        '(e.g. "add coffee 250", "bought groceries for 500", "paid 100 for lunch").\n\n'
+        '"write" = the user is reporting a new ledger entry to be logged -- either an '
+        'expense they made (e.g. "add coffee 250", "bought groceries for 500", "paid 100 '
+        'for lunch") OR money they received (e.g. "got a dividend of 500 from stocks", '
+        '"friend paid me back 300", "received a refund of 200", "salary credited 5000"). '
+        'For money RECEIVED, extract amount as a NEGATIVE number -- this bot logs credits '
+        'as negative entries in the same ledger as expenses.\n\n'
         'If intent is "query", return: {"intent":"query"}\n'
         'If intent is "write", return: {"intent":"write","operation":"add_expense",'
         '"item":string,"amount":number,"day":int,"month":int,"year":int,"notes":string}\n'
         f'Defaults for write if not stated: day={now.day}, month={now.month}, year={now.year}, notes="".\n'
         f'Today: day={now.day}, month={now.month}, year={now.year}.\n'
         f'User message: {user_query!r}\n'
-        'Example write: {"intent":"write","operation":"add_expense","item":"Coffee",'
+        'Example expense: {"intent":"write","operation":"add_expense","item":"Coffee",'
         '"amount":250,"day":15,"month":5,"year":2026,"notes":""}\n'
+        'Example credit/income: {"intent":"write","operation":"add_expense","item":"Dividend",'
+        '"amount":-500,"day":15,"month":5,"year":2026,"notes":""}\n'
         'Example query: {"intent":"query"}\n'
         'Now output JSON:'
     )
@@ -604,25 +622,12 @@ def execute_write(state: AgentState) -> AgentState:  # noqa: C901
         amount = parsed_amount
         # falls through to shared category block below
 
-    # FIX (issue #44): negative amounts used to be handled inconsistently --
-    # silently sign-stripped in the OLD amount-step regex but preserved
-    # unchecked when extracted straight from the LLM's JSON, with no
-    # confirmation either way that a negative ledger entry was intended.
-    # This bot has no refund/reversal concept, so the policy is simple:
-    # negative amounts aren't a supported expense and are rejected outright,
-    # consistently, regardless of which path produced them. Positioned AFTER
-    # Step 2 (not right after "Resolve fields") because Step 2 reassigns
-    # `amount` from the user's typed reply -- checking any earlier would
-    # validate the stale pre-reply value instead of what was actually typed.
-    # (amount == 0 is NOT rejected here -- it's the deliberate sentinel
-    # meaning "not yet provided", handled by the "ask for amount" step above.)
-    if amount < 0:
-        state["final_answer"] = (
-            f"❌ Amount can't be negative (got {amount:.2f}). Please start over with a positive amount."
-        )
-        state["pending_question"] = None
-        state["pending_state"]    = None
-        return state
+    # FIX (issue #46): negative amounts are a deliberate, supported entry --
+    # the user logs credits/income this way (dividends, money received back
+    # from a friend, refunds), not just expenses, and wants everything in
+    # one ledger. (amount == 0 is still not a "negative" value -- it's the
+    # sentinel meaning "not yet provided", handled by the "ask for amount"
+    # step above; only actual negative numbers reach here.)
 
     # FIX (issue #39): nothing validated day/month/year formed a real
     # calendar date -- month=13, day=45/Feb 30, etc. were written to the
@@ -782,16 +787,28 @@ LARGE_AMOUNT_WARNING_THRESHOLD = float(os.getenv("LARGE_AMOUNT_WARNING_THRESHOLD
 
 
 def _success_msg(item, amount, category, notes, day, month, year) -> str:
+    # FIX (issue #46): a negative amount is a deliberate credit/income entry
+    # (dividends, money received back), not a mistake -- format it as
+    # "-₹500.00" (sign before the currency symbol) rather than "₹-500.00",
+    # and label it "Credit" so it doesn't read as an expense.
+    if amount < 0:
+        amount_line = f"💰 Credit: -₹{abs(amount):.2f}"
+    else:
+        amount_line = f"💰 Amount: ₹{amount:.2f}"
+
     msg = (
         f"✅ Added expense:\n"
         f"📦 Item: {item}\n"
-        f"💰 Amount: ₹{amount:.2f}\n"
+        f"{amount_line}\n"
         f"📂 Category: {category}\n"
         f"📝 Note: {notes}\n"
         f"📅 Date: {day}/{month}/{year}"
     )
-    if amount >= LARGE_AMOUNT_WARNING_THRESHOLD:
-        msg += f"\n⚠️ That's a large amount (₹{amount:.2f}) — double check it's correct, not a typo."
+    # FIX (issue #45, revised #46): check the MAGNITUDE, not just large
+    # positive amounts -- a fat-fingered extra zero on a credit ("-150000"
+    # instead of "-1500") is just as much a likely typo as on an expense.
+    if abs(amount) >= LARGE_AMOUNT_WARNING_THRESHOLD:
+        msg += f"\n⚠️ That's a large amount (₹{abs(amount):.2f}) — double check it's correct, not a typo."
     return msg
 
 
