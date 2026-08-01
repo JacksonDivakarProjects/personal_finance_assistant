@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(python -c \"import ast; [ast.parse\\(open\\(f, encoding='utf-8'\\).read\\(\\), f\\) for f in ['agent.py','data_loader.py']]\")",
-      "Bash(.venv/Scripts/python.exe -c ' *)"
+      "Bash(.venv/Scripts/python.exe -c ' *)",
+      "Bash(python scratch_inspect_sheets.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python scratch_inspect_sheets.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python scratch_test_records.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python -c ' *)"
     ]
   }
 }

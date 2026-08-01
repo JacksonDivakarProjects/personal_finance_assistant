@@ -6,6 +6,20 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_for_sheets(value: str) -> str:
+    """
+    FIX (issue #32): with value_input_option='USER_ENTERED', Google Sheets
+    interprets a cell whose text starts with =, +, -, or @ as a formula --
+    e.g. a category typed as "=1+1" or "@SUM(A1:A10)" would silently become a
+    live formula (or a #NAME? error) instead of storing the literal text the
+    user typed. A leading apostrophe forces Sheets to treat the cell as plain
+    text (the apostrophe itself is not stored/displayed).
+    """
+    if value and value[0] in ('=', '+', '-', '@'):
+        return "'" + value
+    return value
+
+
 class DataWriter:
     def __init__(self, sheet_client):
         self.sheet_client = sheet_client
@@ -22,14 +36,25 @@ class DataWriter:
         one API request.  Column H (notes) is written separately because it is
         not contiguous with A–E, but the expense data itself is atomic.
         """
-        item = item.title()
+        item = _sanitize_for_sheets(item.title())
         if not notes or len(notes.strip()) < 2:
             now = datetime.now()
             notes = f"Added via bot on {now.strftime('%Y-%m-%d %H:%M:%S')}"
+        notes = _sanitize_for_sheets(notes)
 
-        sheet   = self.sheet_client.get_worksheet("Expense Journal")
-        col_a   = sheet.col_values(1)
-        next_row = max(len(col_a) + 1, 2)
+        # FIX (issue #29): next_row used to be computed from col_values(1)
+        # (the Year column) alone. gspread/Sheets trims trailing blank cells
+        # PER ROW, so a row where only Year happens to be blank (a plausible
+        # manual edit -- fixing a typo, a misclick) makes that row invisible
+        # to col_values(1), under-counting next_row by 1 and causing the new
+        # expense to silently overwrite that existing row instead of
+        # appending after it. get_all_values() reflects every row with ANY
+        # populated cell, so a row is only "invisible" here if it's fully
+        # blank across every column -- the actual condition that makes a row
+        # safe to write over.
+        sheet    = self.sheet_client.get_worksheet("Expense Journal")
+        all_rows = sheet.get_all_values()
+        next_row = max(len(all_rows) + 1, 2)
 
         try:
             # Write A:E in a single API call (atomic for the core expense data)
@@ -54,8 +79,8 @@ class DataWriter:
         Add a new row to the Item & Category sheet.
         Both values stored in Title Case.
         """
-        item_name = item_name.title()
-        category  = category.title()
+        item_name = _sanitize_for_sheets(item_name.title())
+        category  = _sanitize_for_sheets(category.title())
         try:
             success = self.sheet_client.append_row(
                 "Item & Category", [item_name, category]

@@ -125,25 +125,80 @@ def load_budget(sheet_client, sheet_name):
     return budget
 
 
-def get_actual_spending(expense_df, item_to_cat):
+def load_summary_table(sheet_client):
+    """
+    Load the "Summary Table" sheet's category-wise pivot into a
+    {category: amount} dict.
+
+    This is a native Google Sheets pivot table (Category / SUM of Amount (₹)),
+    not a plain 2-column sheet like Category Budget, so its header text isn't
+    a fixed "Amount" — the first two columns are read positionally instead of
+    by header name. A blank-category row (the pivot's bucket for any
+    uncategorized expense rows) and the "Grand Total" row are skipped; the
+    same first-wins duplicate rule as load_budget/load_item_category applies.
+
+    Deliberately does NOT attempt to read the sheet's Income/Gap/Remaining
+    side panel (columns further right, e.g. col I in practice) — that panel's
+    position isn't tied to the pivot's header/row structure the way this
+    Category/Amount pair is, so parsing it by fixed row offsets would be
+    guessing at a layout rather than reading a real table.
+    """
+    all_data = sheet_client.get_all_values("Summary Table")
+    if len(all_data) < 2:
+        return {}
+
+    rows = [row[:2] for row in all_data[1:]]
+    df = pd.DataFrame(rows, columns=['Category', 'Amount'])
+
+    # The pivot's blank-category bucket represents real Expense Journal rows
+    # whose Category cell was empty (e.g. an unmapped item) — it can carry a
+    # genuinely nonzero amount, so it's folded into 'Uncategorized' rather
+    # than dropped outright; dropping it would silently understate this
+    # dict's total relative to the sheet's own Grand Total with no way for a
+    # caller to detect the gap.
+    df['Category'] = df['Category'].str.strip().replace('', 'Uncategorized')
+    df = df[df['Category'].str.lower() != 'grand total']
+
+    df['Amount'] = (
+        df['Amount']
+        .astype(str)
+        .str.replace('₹', '', regex=False)
+        .str.replace(',', '', regex=False)
+        .str.strip()
+    )
+    df['Amount'] = pd.to_numeric(df['Amount'], errors='coerce')
+    df = df.dropna(subset=['Amount'])
+
+    import logging
+    logger = logging.getLogger(__name__)
+    summary = {}
+    for cat, amt in zip(df['Category'], df['Amount']):
+        if cat in summary:
+            logger.debug("Duplicate summary-table category ignored: '%s' -> %s (keeping %s)",
+                         cat, amt, summary[cat])
+        else:
+            summary[cat] = amt
+    return summary
+
+
+def _resolve_categories(expense_df, item_to_cat):
+    """
+    Return a copy of expense_df with its 'Category' column filled in from
+    item_to_cat wherever the sheet's own Category cell is blank/missing.
+
+    FIX (issue #9): gspread returns empty cells as '' (empty string), not NaN.
+    fillna() only fills NaN — it silently skips '' cells, so items that have
+    an empty Category column in the sheet are excluded unless we replace ''
+    with NaN first, then fillna from the item→category mapping.
+
+    FIX (issue #11): item_to_cat.get()/dict.map() lookups are case-sensitive,
+    but every other lookup in this app (_item_already_mapped, the fuzzy
+    matcher) treats item names case-insensitively. An expense logged as
+    "coffee" would fail to match a mapping keyed "Coffee", leaving Category
+    as NaN — understating total spend with no error or warning. Build a
+    lowercase-keyed lookup so the mapping matches regardless of case.
+    """
     expense_df = expense_df.copy()
-
-    if expense_df.empty:
-        return {}, 0.0
-
-    # FIX (issue #9): gspread returns empty cells as '' (empty string), not NaN.
-    # fillna() only fills NaN — it silently skips '' cells, so items that have
-    # an empty Category column in the sheet are excluded from actual spend even
-    # if they're mapped in item_to_cat.
-    # Fix: replace '' with NaN first, then fillna from the item→category mapping.
-    #
-    # FIX (issue #11): item_to_cat.get()/dict.map() lookups are case-sensitive,
-    # but every other lookup in this app (_item_already_mapped, the fuzzy
-    # matcher) treats item names case-insensitively. An expense logged as
-    # "coffee" would fail to match a mapping keyed "Coffee", leaving Category
-    # as NaN and getting silently dropped by dropna() below — understating
-    # total spend with no error or warning. Build a lowercase-keyed lookup so
-    # the mapping matches regardless of case.
     item_to_cat_lower = {str(k).lower(): v for k, v in item_to_cat.items()}
     if 'Category' in expense_df.columns:
         expense_df['Category'] = expense_df['Category'].replace('', pd.NA)
@@ -152,8 +207,62 @@ def get_actual_spending(expense_df, item_to_cat):
         )
     else:
         expense_df['Category'] = expense_df['Item'].str.lower().map(item_to_cat_lower)
+    return expense_df
 
-    expense_df = expense_df.dropna(subset=['Category'])
-    actual = expense_df.groupby('Category')['Amount (₹)'].sum().to_dict()
+
+def get_actual_spending(expense_df, item_to_cat):
+    if expense_df.empty:
+        return {}, 0.0
+
+    resolved = _resolve_categories(expense_df, item_to_cat).dropna(subset=['Category'])
+    actual = resolved.groupby('Category')['Amount (₹)'].sum().to_dict()
     total  = sum(actual.values())
     return actual, total
+
+
+def get_expense_records(expense_df, item_to_cat, limit=None):
+    """
+    Return per-record expense data (date, item, amount, category), sorted
+    most-recent first, for record-wise / time-scoped query answering (e.g.
+    "how much did I spend last week").
+
+    The date is built from the Year/Month/Day columns rather than any
+    formula-derived sheet column: those three are written by data_writer.py
+    as plain numbers, so combining them is unambiguous, whereas a sheet
+    formula's display format isn't guaranteed and shouldn't be parsed as a
+    data source. (Confirmed via live-sheet inspection: the Expense Journal's
+    column F is actually blank in practice — CLAUDE.md's "F: formula-derived
+    Date" description does not hold, so Year/Month/Day is the only reliable
+    source of a per-row date.)
+
+    Rows whose Year/Month/Day don't combine into a valid date are dropped
+    rather than raising, since this feeds a best-effort query answer, not a
+    write path.
+    """
+    if expense_df.empty:
+        return []
+
+    resolved = _resolve_categories(expense_df, item_to_cat)
+    resolved['Category'] = resolved['Category'].fillna('Uncategorized')
+
+    for col in ('Year', 'Month', 'Day'):
+        if col not in resolved.columns:
+            return []
+        resolved[col] = pd.to_numeric(resolved[col], errors='coerce')
+
+    resolved['_ParsedDate'] = pd.to_datetime(
+        dict(year=resolved['Year'], month=resolved['Month'], day=resolved['Day']),
+        errors='coerce'
+    )
+    resolved = resolved.dropna(subset=['_ParsedDate']).sort_values('_ParsedDate', ascending=False)
+
+    records = [
+        {
+            "date":     row['_ParsedDate'].strftime('%Y-%m-%d'),
+            "item":     row['Item'],
+            "amount":   float(row['Amount (₹)']),
+            "category": row['Category'],
+        }
+        for _, row in resolved.iterrows()
+    ]
+    return records[:limit] if limit is not None else records

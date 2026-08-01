@@ -401,5 +401,281 @@ class TestFullRegressionPass(unittest.TestCase):
         self.assertEqual(r2["pending_state"]["year"], 2026)
 
 
+# ── 9. Write-failure retry (issue #28) ────────────────────────────────────────
+
+class FlakyWorksheetOnce:
+    """Wraps a real FakeWorksheet so its first `update()` call raises, then
+    behaves normally -- simulates a transient Sheets API failure (rate limit,
+    network blip) on the first attempt only."""
+
+    def __init__(self, real_worksheet):
+        self._real = real_worksheet
+        self._update_calls = 0
+
+    def col_values(self, col_idx):
+        return self._real.col_values(col_idx)
+
+    def get_all_values(self):
+        return self._real.get_all_values()
+
+    def update(self, range_notation, values, value_input_option=None):
+        self._update_calls += 1
+        if self._update_calls == 1:
+            raise RuntimeError("simulated Sheets API rate limit")
+        return self._real.update(range_notation, values, value_input_option=value_input_option)
+
+    def update_cell(self, row, col, value):
+        return self._real.update_cell(row, col, value)
+
+    def get_all_records(self):
+        return self._real.get_all_records()
+
+
+class FlakyOnceSheetClient:
+    """Wraps a real FakeSheetClient so the first write to Expense Journal fails."""
+
+    def __init__(self, real_client):
+        self._real = real_client
+        self._flaky_ws = None
+
+    def get_worksheet(self, name):
+        real_ws = self._real.get_worksheet(name)
+        if name == "Expense Journal":
+            if self._flaky_ws is None:
+                self._flaky_ws = FlakyWorksheetOnce(real_ws)
+            return self._flaky_ws
+        return real_ws
+
+    def append_row(self, sheet_name, row_data):
+        return self._real.append_row(sheet_name, row_data)
+
+    def update_cell(self, sheet_name, row, col, value):
+        return self._real.update_cell(sheet_name, row, col, value)
+
+    def get_all_values(self, sheet_name):
+        return self._real.get_all_values(sheet_name)
+
+
+class TestWriteFailureRetry(unittest.TestCase):
+    def test_add_expense_failure_is_reported_and_retry_succeeds(self):
+        """
+        FIX (issue #28): execute_write used to ignore DataWriter's return value
+        and always show a success message, even when the underlying Sheets
+        write failed. Verify a failure is now (a) reported truthfully, (b)
+        preserves enough pending_state to retry, and (c) the retry actually
+        re-attempts and succeeds -- not just that the first call "handles"
+        the error somehow.
+        """
+        real_client, _, _, _ = build_env(
+            item_category_rows=[["Item name", "Category"], ["Coffee", "Food And Grocery"]]
+        )
+        flaky_client = FlakyOnceSheetClient(real_client)
+        writer = SpyWriter(flaky_client)
+        run_agent = agent.build_graph(writer, flaky_client, {})
+
+        scripted = ScriptedLLM([
+            '{"intent":"write","operation":"add_expense","item":"Coffee","amount":50,'
+            '"day":1,"month":8,"year":2026,"notes":""}'
+        ])
+        with patch.object(agent, "llm", scripted):
+            r1 = run_agent(make_state("add coffee 50"))
+
+        self.assertEqual(len(writer.add_expense_calls), 1, "first attempt must actually try to write")
+        self.assertIn("❌", r1["final_answer"], "a genuine write failure must not look like success")
+        self.assertIsNotNone(r1["pending_question"], "must tell the user to retry, not go silent")
+        pending = r1["pending_state"]
+        self.assertIsNotNone(pending, "must preserve enough state to retry the identical write")
+        self.assertEqual(pending["step"], "retry_write")
+        self.assertEqual(pending["item"], "Coffee")
+        self.assertEqual(pending["amount"], 50.0)
+        self.assertEqual(pending["category"], "Food And Grocery")
+
+        scripted2 = ScriptedLLM([])
+        with patch.object(agent, "llm", scripted2):
+            r2 = run_agent(make_state("retry", pending_state=pending))
+
+        self.assertEqual(len(scripted2.calls), 0, "retry must not call the LLM")
+        self.assertEqual(len(writer.add_expense_calls), 2, "retry must re-attempt the write")
+        self.assertIsNone(r2["pending_state"], "must clear pending_state once the retry succeeds")
+        self.assertIn("Added expense", r2["final_answer"])
+
+
+# ── 10. next_row must not collide with a row whose Year cell is blank (issue #29) ─
+
+class TestNextRowDoesNotOverwrite(unittest.TestCase):
+    def test_blank_year_cell_does_not_get_overwritten(self):
+        """
+        FIX (issue #29): next_row used to be computed from col_values(1)
+        (Year) alone. A real row with a blank Year cell but real Item/Amount/
+        Day/Month data was invisible to that check, so a new expense would
+        silently land on top of it and destroy the existing row. Seed exactly
+        that shape and confirm the new expense is appended after it instead.
+        """
+        sheet_client, writer, _, run_agent = build_env(
+            item_category_rows=[["Item name", "Category"], ["Movie Ticket", "Outing"]]
+        )
+        sheet_client.store["Expense Journal"] = [
+            ["Year", "Item", "Amount (₹)", "Day", "Month", "Col6", "Col7", "Notes"],
+            ["2026", "Rent", "20000", "1", "7", "", "", "July rent"],
+            ["", "SalaryBonus", "50000", "15", "7", "", "", "bonus"],  # blank Year, real data
+        ]
+
+        scripted = ScriptedLLM([
+            '{"intent":"write","operation":"add_expense","item":"Movie Ticket","amount":500,'
+            '"day":20,"month":8,"year":2026,"notes":""}'
+        ])
+        with patch.object(agent, "llm", scripted):
+            run_agent(make_state("add movie ticket 500"))
+
+        rows = sheet_client.store["Expense Journal"]
+        self.assertEqual(len(rows), 4, "must APPEND a new row, not overwrite an existing one")
+        self.assertEqual(rows[2][1], "SalaryBonus", "the blank-Year row must survive untouched")
+        self.assertEqual(rows[2][2], "50000")
+        self.assertEqual(rows[3][1], "Movie Ticket", "the new expense must land on a genuinely new row")
+
+
+# ── 11. Comma-formatted amounts must not be truncated (issue #30) ────────────
+
+class TestCommaFormattedAmount(unittest.TestCase):
+    def test_amount_step_reply_with_thousands_comma(self):
+        """
+        FIX (issue #30): the amount-step regex used to match only the first
+        digit group of a comma-separated number -- "1,500" silently became
+        1.0, not 1500.0, with a confident (wrong) success message.
+        """
+        _, writer, _, run_agent = build_env(
+            item_category_rows=[["Item name", "Category"], ["Rent", "Bills"]]
+        )
+        r1, _ = self._write_via_llm_helper(run_agent, "add rent 0", "Rent", 0)
+        pending = r1["pending_state"]
+        self.assertEqual(pending["step"], "amount")
+
+        with patch.object(agent, "llm", ScriptedLLM([])):
+            r2 = run_agent(make_state("1,500", pending_state=pending))
+
+        self.assertEqual(len(writer.add_expense_calls), 1)
+        self.assertEqual(writer.add_expense_calls[0]["amount"], 1500.0,
+                          "must parse the full comma-formatted amount, not just '1'")
+
+    def _write_via_llm_helper(self, run_agent, message, item, amount, day=None, month=None, year=None):
+        now = datetime.now()
+        day, month, year = day or now.day, month or now.month, year or now.year
+        llm_json = (
+            f'{{"intent":"write","operation":"add_expense","item":"{item}","amount":{amount},'
+            f'"day":{day},"month":{month},"year":{year},"notes":""}}'
+        )
+        scripted = ScriptedLLM([llm_json])
+        with patch.object(agent, "llm", scripted):
+            result = run_agent(make_state(message))
+        return result, scripted
+
+
+# ── 12. Greeting-prefix must not swallow real expense messages (issue #31) ───
+
+class TestGreetingPrefixDoesNotSwallowWrites(unittest.TestCase):
+    def test_greeting_prefixed_expense_message_still_reaches_llm_and_writes(self):
+        """
+        FIX (issue #31): "Hi, bought coffee for 250" used to be forced to
+        intent=query by a prefix match on "hi", silently never writing the
+        expense. It must now reach the combined LLM classify+extract call and
+        complete the write.
+        """
+        _, writer, _, run_agent = build_env(
+            item_category_rows=[["Item name", "Category"], ["Coffee", "Food And Grocery"]]
+        )
+        scripted = ScriptedLLM([
+            '{"intent":"write","operation":"add_expense","item":"Coffee","amount":250,'
+            '"day":1,"month":8,"year":2026,"notes":""}'
+        ])
+        with patch.object(agent, "llm", scripted):
+            result = run_agent(make_state("Hi, bought coffee for 250"))
+
+        self.assertEqual(len(scripted.calls), 1, "must reach the combined classify+extract call")
+        self.assertEqual(result.get("intent"), "write")
+        self.assertEqual(len(writer.add_expense_calls), 1)
+        self.assertEqual(writer.add_expense_calls[0]["amount"], 250.0)
+
+    def test_bare_greeting_still_short_circuits_without_llm(self):
+        _, writer, _, run_agent = build_env()
+        scripted = ScriptedLLM([])
+        with patch.object(agent, "llm", scripted):
+            result = run_agent(make_state("Hi!"))
+        self.assertEqual(result.get("intent"), "query")
+        self.assertEqual(len(scripted.calls), 0, "a bare greeting must still skip the LLM entirely")
+
+
+# ── 13. Cancel keyword + input validation at every step (issue #32) ──────────
+
+class TestCancelAndValidation(unittest.TestCase):
+    def test_cancel_at_amount_step(self):
+        _, writer, _, run_agent = build_env()
+        r1, _ = self._add_via_llm(run_agent, "add mango 0", "Mango", 0)
+        pending = r1["pending_state"]
+        self.assertEqual(pending["step"], "amount")
+
+        with patch.object(agent, "llm", ScriptedLLM([])):
+            r2 = run_agent(make_state("cancel", pending_state=pending))
+
+        self.assertIn("Cancelled", r2["final_answer"])
+        self.assertIsNone(r2["pending_state"])
+        self.assertIsNone(r2["pending_question"])
+        self.assertEqual(len(writer.add_expense_calls), 0)
+
+    def test_cancel_at_category_confirm_step(self):
+        _, writer, _, run_agent = build_env()  # empty Item & Category -> triggers suggestion path
+        r1, _ = self._add_via_llm(run_agent, "add coffee 100", "Coffee", 100)
+        pending = r1["pending_state"]
+        self.assertEqual(pending["step"], "category_confirm")
+
+        with patch.object(agent, "llm", ScriptedLLM([])):
+            r2 = run_agent(make_state("never mind", pending_state=pending))
+
+        self.assertIn("Cancelled", r2["final_answer"])
+        self.assertIsNone(r2["pending_state"])
+        self.assertEqual(len(writer.add_expense_calls), 0)
+        self.assertEqual(len(writer.add_category_mapping_calls), 0)
+
+    def test_empty_reply_at_category_confirm_reprompts_instead_of_blank_category(self):
+        """FIX (issue #32): an empty/whitespace reply used to silently become
+        a permanent BLANK category. Must re-ask instead."""
+        _, writer, _, run_agent = build_env()
+        r1, _ = self._add_via_llm(run_agent, "add coffee 100", "Coffee", 100)
+        pending = r1["pending_state"]
+        self.assertEqual(pending["step"], "category_confirm")
+
+        with patch.object(agent, "llm", ScriptedLLM([])):
+            r2 = run_agent(make_state("   ", pending_state=pending))
+
+        self.assertEqual(len(writer.add_category_mapping_calls), 0, "must not write a blank category")
+        self.assertEqual(len(writer.add_expense_calls), 0)
+        self.assertIsNotNone(r2["pending_state"], "must re-prompt, preserving the pending entry")
+        self.assertEqual(r2["pending_state"]["step"], "category_confirm")
+
+    def test_formula_injection_category_is_escaped(self):
+        """FIX (issue #32): a category typed as '=1+1' must not become a live
+        Sheets formula -- it should be stored as literal text."""
+        sheet_client, writer, _, run_agent = build_env()
+        r1, _ = self._add_via_llm(run_agent, "add coffee 100", "Coffee", 100)
+        pending = r1["pending_state"]
+        self.assertEqual(pending["step"], "category_confirm")
+
+        with patch.object(agent, "llm", ScriptedLLM([])):
+            run_agent(make_state("=1+1", pending_state=pending))
+
+        mapping_rows = sheet_client.store["Item & Category"]
+        self.assertEqual(mapping_rows[-1][1][0], "'", "formula-leading category must be stored as literal text")
+
+    def _add_via_llm(self, run_agent, message, item, amount):
+        now = datetime.now()
+        llm_json = (
+            f'{{"intent":"write","operation":"add_expense","item":"{item}","amount":{amount},'
+            f'"day":{now.day},"month":{now.month},"year":{now.year},"notes":""}}'
+        )
+        scripted = ScriptedLLM([llm_json])
+        with patch.object(agent, "llm", scripted):
+            result = run_agent(make_state(message))
+        return result, scripted
+
+
 if __name__ == "__main__":
     unittest.main()

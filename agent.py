@@ -9,7 +9,10 @@ from typing import TypedDict, Dict, Any, Optional, Literal
 from langgraph.graph import StateGraph, END
 from langchain_groq import ChatGroq
 from config import GROQ_API_KEY, MODEL_NAME
-from data_loader import load_expense_journal, load_item_category, load_budget, get_actual_spending
+from data_loader import (
+    load_expense_journal, load_item_category, load_budget, load_summary_table,
+    get_actual_spending, get_expense_records,
+)
 from data_writer import DataWriter
 from sheet_client import SheetClient
 
@@ -51,20 +54,22 @@ def _refresh_data_context(data_context: dict) -> None:
     if not sheet_client:
         return
     try:
-        expense_df  = load_expense_journal(sheet_client)
-        item_to_cat = load_item_category(sheet_client)
-        budget_dict = load_budget(sheet_client, "Category Budget")
+        expense_df    = load_expense_journal(sheet_client)
+        item_to_cat   = load_item_category(sheet_client)
+        budget_dict   = load_budget(sheet_client, "Category Budget")
+        summary_table = load_summary_table(sheet_client)
         actual_spend, total_actual = get_actual_spending(expense_df, item_to_cat)
         # FIX (issue #27): "Next Month Budget" fallback removed — that
         # worksheet no longer exists in the spreadsheet.
         for cat in actual_spend:
             if cat not in budget_dict:
                 budget_dict[cat] = 0.0
-        data_context["actual"]       = actual_spend
-        data_context["budget"]       = budget_dict
-        data_context["total_actual"] = total_actual
-        data_context["expense_df"]   = expense_df
-        data_context["item_to_cat"]  = item_to_cat
+        data_context["actual"]        = actual_spend
+        data_context["budget"]        = budget_dict
+        data_context["summary_table"] = summary_table
+        data_context["total_actual"]  = total_actual
+        data_context["expense_df"]    = expense_df
+        data_context["item_to_cat"]   = item_to_cat
     except Exception:
         logger.exception("_refresh_data_context failed")
 
@@ -112,6 +117,23 @@ def suggest_category_by_similarity(item: str, existing_categories: list) -> tupl
     if matches:
         return cat_lower_to_original[matches[0]], 0.7
     return None, 0.0
+
+
+def _extract_amount(text: str) -> Optional[float]:
+    """
+    Find the first numeric amount in free text.
+
+    FIX (issue #30): a bare r'\b(\d+(?:\.\d+)?)\b' search matches only the
+    FIRST digit group of a comma-thousands-separated number -- "1,500" or
+    "Rs. 12,000" (completely normal Indian-format amounts) matched just "1"
+    or "12", silently truncating a real expense by 10x-1000x while still
+    reporting a confident success message. Strip commas before searching so
+    "1,500" / "12,00,000" are read as single numbers; a comma that instead
+    separates two different numbers in the message ("500, 200 for food")
+    still resolves correctly since a space remains between the two groups.
+    """
+    m = re.search(r'\b(\d+(?:\.\d+)?)\b', text.replace(',', ''))
+    return float(m.group(1)) if m else None
 
 
 def _extract_json(text: str) -> Optional[dict]:
@@ -254,9 +276,8 @@ def _classify_and_extract_via_llm(user_query: str) -> Optional[dict]:
         if not parsed.get("item"):
             return None  # no safe way to proceed without an item name
         parsed["item"] = str(parsed["item"])
-        m = re.search(r'\b(\d+(?:\.\d+)?)\b', user_query)
         amount = parsed.get("amount")
-        parsed["amount"] = float(amount) if amount else (float(m.group(1)) if m else 0)
+        parsed["amount"] = float(amount) if amount else (_extract_amount(user_query) or 0)
         parsed["day"]    = int(parsed.get("day")   or now.day)
         parsed["month"]  = int(parsed.get("month") or now.month)
         parsed["year"]   = int(parsed.get("year")  or now.year)
@@ -276,8 +297,18 @@ def classify_intent(state: AgentState) -> AgentState:
 
     # Cheap deterministic short-circuit: no need to spend an LLM call on an
     # unambiguous greeting.
-    greetings = ("hi", "hello", "hey", "good morning", "good evening", "how are you")
-    if text in greetings or text.startswith(greetings):
+    #
+    # FIX (issue #31): text.startswith(greetings) matched on PREFIX, so any
+    # real expense message that merely *begins* with a greeting word --
+    # "Hi, bought coffee for 250", "hey I spent 500 on rent today", "good
+    # morning add 300 milk" -- was forced to intent=query and the expense was
+    # silently never written, with no error and (since this fires on the very
+    # first message) no pending_state to recover from. Only short-circuit
+    # when the ENTIRE message (after stripping trivial trailing punctuation)
+    # IS the greeting -- anything with real content after it now falls
+    # through to the LLM/rule-based classifier instead of being swallowed.
+    greetings = {"hi", "hello", "hey", "good morning", "good evening", "how are you"}
+    if text.rstrip(" !.?") in greetings:
         state["intent"] = "query"
         return state
 
@@ -328,8 +359,7 @@ def parse_write_intent(state: AgentState) -> AgentState:
 
     if parsed is None:
         # Full fallback: regex extraction from raw query
-        amount_match = re.search(r'\b(\d+(?:\.\d+)?)\b', state["user_query"])
-        amount = float(amount_match.group(1)) if amount_match else 0
+        amount = _extract_amount(state["user_query"]) or 0
         item = "Unknown"
         for w in state["user_query"].split():
             if (w.lower() not in {"add", "for", "rs", "rupees", "₹", "on", "at"}
@@ -345,8 +375,7 @@ def parse_write_intent(state: AgentState) -> AgentState:
     try:
         parsed.setdefault("operation", "add_expense")
         if not parsed.get("amount"):
-            m = re.search(r'\b(\d+(?:\.\d+)?)\b', state["user_query"])
-            parsed["amount"] = float(m.group(1)) if m else 0
+            parsed["amount"] = _extract_amount(state["user_query"]) or 0
         if not parsed.get("item"):
             for w in state["user_query"].split():
                 if (w.lower() not in {"add", "for", "rs", "rupees", "₹", "on", "at"}
@@ -365,6 +394,51 @@ def parse_write_intent(state: AgentState) -> AgentState:
     return state
 
 
+def _finalize_expense_write(ctx, writer, item, amount, category, notes, day, month, year, needs_mapping):
+    """
+    Perform the actual sheet write(s) and report what REALLY happened.
+
+    FIX (issue #28): DataWriter.add_expense/add_category_mapping never raise —
+    they catch Sheets API errors internally and return a "❌ Failed..."
+    string instead. Every call site used to ignore that return value entirely
+    and unconditionally show a success message, so a genuine write failure
+    (rate limit, auth hiccup, network blip) was reported to the user as a
+    successful save while nothing was actually written. Check the return
+    value here and propagate real success/failure to the caller.
+    """
+    if needs_mapping:
+        map_result = writer.add_category_mapping(item, category)
+        if map_result.startswith("❌"):
+            return False, f"{map_result}\nYour expense was NOT saved — nothing else was written either."
+        _refresh_data_context(ctx)
+
+    expense_result = writer.add_expense(year, item, amount, day, month, notes=notes)
+    if expense_result.startswith("❌"):
+        return False, expense_result
+    _refresh_data_context(ctx)
+    return True, _success_msg(item, amount, category, notes, day, month, year)
+
+
+def _retry_pending_state(item, amount, category, notes, day, month, year, needs_mapping):
+    """Pending state for a failed write: any reply re-attempts the identical write."""
+    return {
+        "step": "retry_write",
+        "parsed": {"operation": "add_expense"},
+        "item": item, "amount": amount, "day": day, "month": month, "year": year,
+        "notes": notes, "category": category, "needs_mapping": needs_mapping,
+    }
+
+
+# FIX (issue #32): there was no cancel/escape keyword anywhere. Once
+# pending_state is active, classify_intent forces intent="write" unconditionally
+# with no exception, so a user had zero way to back out of a multi-turn entry --
+# any interrupting message got misread as an answer to whichever step was
+# active (at best a confusing re-prompt, at worst -- category_confirm/newcat --
+# permanently written to the sheet as a bogus category). Checked before any
+# step-specific logic, for every step including a failed-write retry.
+CANCEL_KEYWORDS = {"cancel", "stop", "never mind", "nevermind", "quit", "exit", "no thanks"}
+
+
 # ── Execute write ─────────────────────────────────────────────────────────────
 def execute_write(state: AgentState) -> AgentState:  # noqa: C901
     pending = state.get("pending_state")
@@ -378,6 +452,13 @@ def execute_write(state: AgentState) -> AgentState:  # noqa: C901
     if pending:
         step        = pending.get("step")
         user_answer = state["user_query"].strip()
+
+        if user_answer.lower().rstrip(" !.?") in CANCEL_KEYWORDS:
+            state["final_answer"]     = "🚫 Cancelled — nothing was saved."
+            state["pending_question"] = None
+            state["pending_state"]    = None
+            return state
+
         state["parsed_write"]     = pending.get("parsed", {})
         # DO NOT replace state["data_context"] — keep the module-level dict
         state["pending_question"] = None
@@ -428,6 +509,24 @@ def execute_write(state: AgentState) -> AgentState:  # noqa: C901
     if not user_notes:
         user_notes = f"Added on {now.strftime('%Y-%m-%d %H:%M')}"
 
+    # ── Retry step: a previous write attempt failed, re-attempt it verbatim ─
+    if step == "retry_write":
+        category      = pending.get("category", "")
+        needs_mapping = pending.get("needs_mapping", False)
+        success, message = _finalize_expense_write(
+            ctx, writer, item, amount, category, user_notes, day, month, year, needs_mapping,
+        )
+        state["final_answer"] = message
+        if success:
+            state["pending_question"] = None
+            state["pending_state"]    = None
+        else:
+            state["pending_question"] = f"{message}\nReply anything to try again."
+            state["pending_state"] = _retry_pending_state(
+                item, amount, category, user_notes, day, month, year, needs_mapping,
+            )
+        return state
+
     # ── Step 1: ask for amount if missing ─────────────────────────────────
     if step is None and amount == 0:
         state["pending_question"] = f"💰 How much did you spend on {item}? (e.g., 150)"
@@ -440,8 +539,8 @@ def execute_write(state: AgentState) -> AgentState:  # noqa: C901
 
     # ── Step 2: received amount ────────────────────────────────────────────
     if step == "amount":
-        m = re.search(r'\b(\d+(?:\.\d+)?)\b', user_answer)
-        if not m:
+        parsed_amount = _extract_amount(user_answer)  # FIX issue #30: tolerates "1,500" etc.
+        if parsed_amount is None:
             # FIX (issue #26): this used to return a bare final_answer with no
             # pending_state — since the top of this function already cleared
             # pending_state/pending_question unconditionally, a non-numeric
@@ -458,18 +557,26 @@ def execute_write(state: AgentState) -> AgentState:  # noqa: C901
                 "item": item, "day": day, "month": month, "year": year, "notes": user_notes,
             }
             return state
-        amount = float(m.group(1))
+        amount = parsed_amount
         # falls through to shared category block below
 
     # ── Shared block: have item + amount, resolve category ─────────────────
     if step in (None, "amount"):
         existing_cat = _item_already_mapped(item, item_to_cat)
         if existing_cat:
-            writer.add_expense(year, item, amount, day, month, notes=user_notes)
-            _refresh_data_context(ctx)
-            state["final_answer"]     = _success_msg(item, amount, existing_cat, user_notes, day, month, year)
-            state["pending_question"] = None
-            state["pending_state"]    = None
+            success, message = _finalize_expense_write(
+                ctx, writer, item, amount, existing_cat, user_notes, day, month, year,
+                needs_mapping=False,
+            )
+            state["final_answer"] = message
+            if success:
+                state["pending_question"] = None
+                state["pending_state"]    = None
+            else:
+                state["pending_question"] = f"{message}\nReply anything to try again."
+                state["pending_state"] = _retry_pending_state(
+                    item, amount, existing_cat, user_notes, day, month, year, needs_mapping=False,
+                )
             return state
 
         suggested_cat, _ = suggest_category_by_similarity(item, existing_categories)
@@ -525,20 +632,34 @@ def execute_write(state: AgentState) -> AgentState:  # noqa: C901
                 "year": year, "notes": user_notes,
             }
             return state
+        elif not cat_response:
+            # FIX (issue #32): an empty/whitespace-only reply used to fall
+            # through to `.title()` ("" -> ""), permanently writing a BLANK
+            # category to the sheet. Re-ask instead of accepting nothing.
+            state["pending_question"] = (
+                f"📂 Match '{item}' to category '{suggested}'?\n"
+                f"Reply y / n, or type a category name (or 'cancel')."
+            )
+            state["pending_state"] = pending
+            return state
         else:
             category = cat_response.title()
 
         # Re-check after refresh to avoid duplicate mapping
         _refresh_data_context(ctx)
-        if not _item_already_mapped(item, ctx.get("item_to_cat", {})):
-            writer.add_category_mapping(item, category)
-            _refresh_data_context(ctx)
-
-        writer.add_expense(year, item, amount, day, month, notes=user_notes)
-        _refresh_data_context(ctx)
-        state["final_answer"]     = _success_msg(item, amount, category, user_notes, day, month, year)
-        state["pending_question"] = None
-        state["pending_state"]    = None
+        needs_mapping = not _item_already_mapped(item, ctx.get("item_to_cat", {}))
+        success, message = _finalize_expense_write(
+            ctx, writer, item, amount, category, user_notes, day, month, year, needs_mapping,
+        )
+        state["final_answer"] = message
+        if success:
+            state["pending_question"] = None
+            state["pending_state"]    = None
+        else:
+            state["pending_question"] = f"{message}\nReply anything to try again."
+            state["pending_state"] = _retry_pending_state(
+                item, amount, category, user_notes, day, month, year, needs_mapping,
+            )
         return state
 
     # ── Step 4: new category name ──────────────────────────────────────────
@@ -547,15 +668,19 @@ def execute_write(state: AgentState) -> AgentState:  # noqa: C901
         category = user_answer.strip().title() if user_answer.strip() else "Miscellaneous"
 
         _refresh_data_context(ctx)
-        if not _item_already_mapped(item, ctx.get("item_to_cat", {})):
-            writer.add_category_mapping(item, category)
-            _refresh_data_context(ctx)
-
-        writer.add_expense(year, item, amount, day, month, notes=user_notes)
-        _refresh_data_context(ctx)
-        state["final_answer"]     = _success_msg(item, amount, category, user_notes, day, month, year)
-        state["pending_question"] = None
-        state["pending_state"]    = None
+        needs_mapping = not _item_already_mapped(item, ctx.get("item_to_cat", {}))
+        success, message = _finalize_expense_write(
+            ctx, writer, item, amount, category, user_notes, day, month, year, needs_mapping,
+        )
+        state["final_answer"] = message
+        if success:
+            state["pending_question"] = None
+            state["pending_state"]    = None
+        else:
+            state["pending_question"] = f"{message}\nReply anything to try again."
+            state["pending_state"] = _retry_pending_state(
+                item, amount, category, user_notes, day, month, year, needs_mapping,
+            )
         return state
 
     state["final_answer"] = "Unexpected state. Please start over."
@@ -582,7 +707,11 @@ def answer_query_node(state: AgentState) -> AgentState:
 
     user_q = state["user_query"].lower().strip()
     greetings = {"hi", "hello", "hey", "good morning", "good evening", "greetings", "how are you"}
-    if user_q in greetings:
+    # FIX (issue #31, related): this was an exact match with no punctuation
+    # stripping, inconsistent with classify_intent's greeting check -- "Hi!"
+    # would skip classify_intent's LLM call (correctly) but then still fall
+    # through here into a full LLM call just to answer a bare greeting.
+    if user_q.rstrip(" !.?") in greetings:
         state["final_answer"] = (
             "Hello! I'm your finance assistant. You can add expenses or ask about "
             "your spending. For example: 'Add coffee 250 rs today' or "
@@ -590,11 +719,14 @@ def answer_query_node(state: AgentState) -> AgentState:
         )
         return state
 
-    actual = state["data_context"].get("actual", {})
-    budget = state["data_context"].get("budget", {})
-    total  = state["data_context"].get("total_actual", 0.0)
+    actual        = state["data_context"].get("actual", {})
+    budget        = state["data_context"].get("budget", {})
+    total         = state["data_context"].get("total_actual", 0.0)
+    summary_table = state["data_context"].get("summary_table", {})
+    expense_df    = state["data_context"].get("expense_df")
+    item_to_cat   = state["data_context"].get("item_to_cat", {})
 
-    lines = [f"Total expenses: ₹{total:.2f}", "\nCategory breakdown (Actual vs Budget):"]
+    lines = [f"Total expenses (live, computed from Expense Journal): ₹{total:.2f}", "\nCategory breakdown (Actual vs Budget):"]
     for cat in sorted(actual.keys()):
         act    = actual.get(cat, 0)
         bud    = budget.get(cat, 0)
@@ -602,10 +734,50 @@ def answer_query_node(state: AgentState) -> AgentState:
         status = "over" if diff > 0 else "under" if diff < 0 else "on track"
         lines.append(f"  {cat}: ₹{act:.2f} vs ₹{bud:.2f} ({status} by ₹{abs(diff):.2f})")
 
+    # Category-wise totals straight from the sheet's own "Summary Table" pivot
+    # (a separate tab from Expense Journal/Category Budget). Shown alongside
+    # the computed breakdown above rather than merged into it, since it's a
+    # distinct source the user views directly — if it ever disagrees with the
+    # computed actuals (e.g. pivot not yet refreshed), that should be visible
+    # rather than silently reconciled.
+    if summary_table:
+        lines.append("\nCategory-wise spending (from the sheet's own Summary Table pivot — "
+                     "a secondary cross-check; it may lag the live totals above by one refresh):")
+        for cat in sorted(summary_table.keys()):
+            lines.append(f"  {cat}: ₹{summary_table[cat]:.2f}")
+        lines.append(f"  Summary Table Grand Total: ₹{sum(summary_table.values()):.2f}")
+
+    # Record-wise, time-attached data from the Expense Journal, so the LLM
+    # can answer time-scoped questions ("last week", "yesterday", "this
+    # month") itself instead of only ever seeing the all-time category
+    # totals above. Capped to bound prompt size; if the sheet has more rows
+    # than the cap, only the most recent are shown and that's called out
+    # explicitly so the LLM doesn't silently treat a partial view as complete.
+    RECORD_LIMIT  = 300
+    all_records   = get_expense_records(expense_df, item_to_cat) if expense_df is not None else []
+    records       = all_records[:RECORD_LIMIT]
+    if records:
+        lines.append(f"\nIndividual expense records, most recent first (date, item, amount, category):")
+        if len(all_records) > RECORD_LIMIT:
+            lines.append(f"(showing the {RECORD_LIMIT} most recent records; older records exist but aren't shown)")
+        for r in records:
+            lines.append(f"  {r['date']} | {r['item']} | ₹{r['amount']:.2f} | {r['category']}")
+
     data_text = "\n".join(lines)
+    today_str = datetime.now().strftime("%Y-%m-%d")
     prompt = (
         "Answer this finance question using only the data provided. "
         "If the question is not about finances, ignore the data and respond helpfully.\n"
+        f"Today's date is {today_str}.\n"
+        "The category breakdown below covers all-time actual-vs-budget spend. "
+        "For any overall/total spending question, prefer 'Total expenses' over the "
+        "Summary Table's Grand Total — the former is computed live from every "
+        "Expense Journal row, the latter is the sheet's own pivot and may lag by "
+        "one refresh; only reference the Summary Table block specifically if the "
+        "user asks about it directly, or the two disagree and that's worth noting. "
+        "The individual records list below it is what you should filter/sum over "
+        "yourself for any question scoped to a specific time period (e.g. "
+        "'last week', 'yesterday', 'this month').\n"
         f"Data:\n{data_text}\n"
         f"Question: {state['user_query']}\n"
         "Answer:"

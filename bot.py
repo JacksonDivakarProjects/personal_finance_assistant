@@ -8,7 +8,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from sheet_client import SheetClient
-from data_loader import load_expense_journal, load_item_category, load_budget, get_actual_spending
+from data_loader import (
+    load_expense_journal, load_item_category, load_budget,
+    load_summary_table, get_actual_spending,
+)
 from data_writer import DataWriter
 from agent import build_graph, AgentState
 
@@ -32,9 +35,10 @@ if not TELEGRAM_TOKEN:
 # ----------------------------------------------------------------------
 sheet_client = SheetClient()
 
-expense_df  = load_expense_journal(sheet_client)
-item_to_cat = load_item_category(sheet_client)
-budget_dict = load_budget(sheet_client, "Category Budget")
+expense_df    = load_expense_journal(sheet_client)
+item_to_cat   = load_item_category(sheet_client)
+budget_dict   = load_budget(sheet_client, "Category Budget")
+summary_table = load_summary_table(sheet_client)
 
 actual_spend, total_actual = get_actual_spending(expense_df, item_to_cat)
 
@@ -47,13 +51,14 @@ for cat in actual_spend:
         budget_dict[cat] = 0.0
 
 data_context = {
-    "actual":       actual_spend,
-    "budget":       budget_dict,
-    "total_actual": total_actual,
-    "expense_df":   expense_df,
-    "item_to_cat":  item_to_cat,
-    "sheet_client": sheet_client,
-    "writer":       None,   # filled inside build_graph
+    "actual":        actual_spend,
+    "budget":        budget_dict,
+    "summary_table": summary_table,
+    "total_actual":  total_actual,
+    "expense_df":    expense_df,
+    "item_to_cat":   item_to_cat,
+    "sheet_client":  sheet_client,
+    "writer":        None,   # filled inside build_graph
 }
 
 writer    = DataWriter(sheet_client)

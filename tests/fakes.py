@@ -39,6 +39,9 @@ class FakeWorksheet:
         rows = self.client.store.get(self.name, [])
         return [(row[col_idx - 1] if len(row) >= col_idx else '') for row in rows]
 
+    def get_all_values(self) -> List[list]:
+        return self.client.store.get(self.name, [])
+
     def update(self, range_notation: str, values, value_input_option=None):
         self.client.update_calls.append((self.name, range_notation, values, value_input_option))
         start_col, start_row, _end_col, _end_row = _parse_range(range_notation)
