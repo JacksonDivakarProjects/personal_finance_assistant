@@ -533,6 +533,25 @@ def execute_write(state: AgentState) -> AgentState:  # noqa: C901
     if not user_notes:
         user_notes = f"Added on {now.strftime('%Y-%m-%d %H:%M')}"
 
+    # FIX (issue #39): nothing validated day/month/year formed a real
+    # calendar date -- month=13, day=45/Feb 30, etc. were written to the
+    # sheet verbatim (even echoed back in the success message). Since
+    # get_expense_records parses these via pd.to_datetime(errors='coerce')
+    # and drops unparseable dates, a bad date used to silently disappear from
+    # time-scoped query answers while still counting in all-time totals from
+    # get_actual_spending -- an inconsistency invisible until someone asks a
+    # time-scoped question. Reject before ever reaching a write.
+    try:
+        datetime(year, month, day)
+    except ValueError:
+        state["final_answer"] = (
+            f"❌ {day}/{month}/{year} isn't a real date. Please start over with a valid date, "
+            f"e.g. 'add {item} {amount if amount else 150} on 15/6/2026'."
+        )
+        state["pending_question"] = None
+        state["pending_state"]    = None
+        return state
+
     # ── Retry step: a previous write attempt failed, re-attempt it verbatim ─
     if step == "retry_write":
         category      = pending.get("category", "")
@@ -782,6 +801,12 @@ def answer_query_node(state: AgentState) -> AgentState:
         for label in ("Income", "Expense", "Gap", "Remaining (At Hand)"):
             if label in summary_panel:
                 lines.append(f"  {label}: ₹{summary_panel[label]:.2f}")
+    else:
+        # Without this, the prompt's instruction below ("use the
+        # Income/Gap/Remaining block") would point at data that silently
+        # isn't there, and the LLM could guess a plausible-looking income
+        # figure instead of saying it doesn't know.
+        lines.append("\nIncome/Gap/Remaining data is not available right now.")
 
     # Record-wise, time-attached data from the Expense Journal, so the LLM
     # can answer time-scoped questions ("last week", "yesterday", "this
@@ -812,8 +837,9 @@ def answer_query_node(state: AgentState) -> AgentState:
         "one refresh; only reference the Summary Table block specifically if the "
         "user asks about it directly, or the two disagree and that's worth noting. "
         "For questions about income, the gap between income and spending, or how "
-        "much money is remaining/left/at hand, use the Income/Gap/Remaining block — "
-        "no other data here covers income. "
+        "much money is remaining/left/at hand, use the Income/Gap/Remaining block if "
+        "present below — no other data here covers income. If that block instead says "
+        "the data isn't available, say so plainly rather than guessing a number. "
         "The individual records list below it is what you should filter/sum over "
         "yourself for any question scoped to a specific time period (e.g. "
         "'last week', 'yesterday', 'this month').\n"

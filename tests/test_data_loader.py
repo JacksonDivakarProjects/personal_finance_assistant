@@ -12,7 +12,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from data_loader import load_expense_journal, load_budget, get_actual_spending
+from data_loader import load_expense_journal, load_budget, load_item_category, get_actual_spending
 
 
 class FakeValuesClient:
@@ -96,6 +96,25 @@ class TestMalformedAmountLogged(unittest.TestCase):
             any("BadRow" in m and "#REF!" in m for m in logs),
             f"expected a warning naming the dropped row and its raw value, got: {logs}",
         )
+
+
+class TestDuplicateHeaderDoesNotCrash(unittest.TestCase):
+    def test_duplicate_category_header_column_is_handled(self):
+        """
+        FIX (issue #41): load_item_category used to call get_all_records(),
+        which raises on a duplicate header column (e.g. "Category" appearing
+        twice from a copy-paste slip while adding a column) -- uncaught,
+        crashing bot.py's startup. Must not crash, and must read the FIRST
+        matching "Category" column.
+        """
+        client = FakeValuesClient({
+            "Item & Category": [
+                ["Item name", "Category", "Category"],
+                ["Coffee", "Food And Grocery", "ignored"],
+            ]
+        })
+        mapping = load_item_category(client)
+        self.assertEqual(mapping, {"coffee": "Food And Grocery"})
 
 
 if __name__ == "__main__":

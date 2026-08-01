@@ -697,5 +697,48 @@ class TestCategoryCaseMerge(unittest.TestCase):
         self.assertEqual(budget_dict["Totally New Category"], 0.0)
 
 
+# ── 15. Invalid calendar dates must be rejected before writing (issue #39) ────
+
+class TestInvalidDateRejected(unittest.TestCase):
+    def test_month_13_is_rejected_not_written(self):
+        _, writer, _, run_agent = build_env()
+        scripted = ScriptedLLM([
+            '{"intent":"write","operation":"add_expense","item":"Rent","amount":500,'
+            '"day":15,"month":13,"year":2026,"notes":""}'
+        ])
+        with patch.object(agent, "llm", scripted):
+            result = run_agent(make_state("add rent 500 on 15/13"))
+
+        self.assertEqual(len(writer.add_expense_calls), 0, "must not write an impossible date")
+        self.assertIn("isn't a real date", result["final_answer"])
+        self.assertIsNone(result["pending_state"])
+
+    def test_feb_30_is_rejected_not_written(self):
+        _, writer, _, run_agent = build_env()
+        scripted = ScriptedLLM([
+            '{"intent":"write","operation":"add_expense","item":"Gift","amount":200,'
+            '"day":30,"month":2,"year":2026,"notes":""}'
+        ])
+        with patch.object(agent, "llm", scripted):
+            result = run_agent(make_state("add gift 200 on feb 30"))
+
+        self.assertEqual(len(writer.add_expense_calls), 0)
+        self.assertIn("isn't a real date", result["final_answer"])
+
+    def test_valid_date_still_writes_normally(self):
+        _, writer, _, run_agent = build_env(
+            item_category_rows=[["Item name", "Category"], ["Rent", "Bills"]]
+        )
+        scripted = ScriptedLLM([
+            '{"intent":"write","operation":"add_expense","item":"Rent","amount":500,'
+            '"day":29,"month":2,"year":2028,"notes":""}'  # 2028 is a leap year -- valid Feb 29
+        ])
+        with patch.object(agent, "llm", scripted):
+            result = run_agent(make_state("add rent 500 on 29/2/2028"))
+
+        self.assertEqual(len(writer.add_expense_calls), 1)
+        self.assertNotIn("isn't a real date", result["final_answer"])
+
+
 if __name__ == "__main__":
     unittest.main()

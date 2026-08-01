@@ -83,24 +83,33 @@ def load_item_category(sheet_client):
     (`_item_already_mapped`, `get_actual_spending`'s `item_to_cat_lower`)
     then had to silently collapse them again, non-deterministically, with no
     logging. Return the already-deduped lowercase mapping directly instead.
+
+    FIX (issue #41): this used to call get_all_records(), which raises
+    gspread's GspreadException the moment the header row has a duplicate
+    column name (e.g. "Item name","Category","Category" from a copy-paste
+    slip while adding a column) -- uncaught here, crashing startup (or
+    freezing on stale data mid-session, since _refresh_data_context's
+    broad except only catches it one layer up). Read the sheet with
+    get_all_values() instead -- positional, like load_budget already does --
+    which has no such header-uniqueness requirement.
     """
-    records = sheet_client.get_worksheet("Item & Category").get_all_records()
-    if not records:
+    all_data = sheet_client.get_all_values("Item & Category")
+    if len(all_data) < 2:
         return {}
 
     import logging
     logger = logging.getLogger(__name__)
 
-    df = pd.DataFrame(records)
-    df.columns = [c.strip() for c in df.columns]
-
-    if 'Item name' not in df.columns or 'Category' not in df.columns:
+    headers = [h.strip() for h in all_data[0]]
+    if 'Item name' not in headers or 'Category' not in headers:
         return {}
+    item_idx = headers.index('Item name')
+    cat_idx  = headers.index('Category')
 
     mapping = {}
-    for _, row in df.iterrows():
-        item_raw = str(row['Item name']).strip()
-        cat_raw  = str(row['Category']).strip()
+    for row in all_data[1:]:
+        item_raw = str(row[item_idx]).strip() if item_idx < len(row) else ''
+        cat_raw  = str(row[cat_idx]).strip()  if cat_idx  < len(row) else ''
         if not item_raw or not cat_raw:
             continue
         key = item_raw.lower()
@@ -254,6 +263,7 @@ def load_summary_panel(sheet_client):
     best-effort query answer, not a write path.
     """
     KNOWN_LABELS = ("Expense", "Income", "Gap", "Remaining (At Hand)")
+    PIVOT_COLUMNS = 2  # columns 0-1 are the pivot's own Category/Amount — never part of the panel
 
     import logging
     logger = logging.getLogger(__name__)
@@ -262,6 +272,11 @@ def load_summary_panel(sheet_client):
     panel = {}
     for i, row in enumerate(all_data):
         for j, cell in enumerate(row):
+            if j < PIVOT_COLUMNS:
+                # Skip the pivot's own columns so a category coincidentally
+                # named e.g. "Income" or "Gap" can never be mistaken for a
+                # side-panel label — the panel only ever lives past column 1.
+                continue
             label = str(cell).strip()
             if label not in KNOWN_LABELS or label in panel:
                 continue

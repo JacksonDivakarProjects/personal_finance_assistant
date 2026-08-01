@@ -109,39 +109,50 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Process user message and reply with the agent's answer."""
-    user_input = update.message.text
-    chat_id    = update.effective_chat.id
-
-    if ALLOWED_CHAT_ID and str(chat_id) != str(ALLOWED_CHAT_ID):
-        logger.warning("Unauthorised access from chat %s", chat_id)
-        await update.message.reply_text("Sorry, you are not authorised to use this bot.")
-        return
-
-    logger.info("User %s: %s", chat_id, user_input)
-
-    pending_state = context.user_data.get("pending_state")
-
-    # BUG FIX #17: AgentState is a TypedDict — constructing it with all keys
-    # explicitly is the only safe way; any missing key causes a runtime error
-    # when langgraph reads it.  The original code was correct here but lacked
-    # the "intent" and "parsed_write" initialisations on some code paths.
-    # Ensured all seven keys are always present.
-    state: AgentState = {
-        "user_query":       user_input,
-        "intent":           None,
-        "parsed_write":     None,
-        "data_context":     data_context,
-        "final_answer":     "",
-        "pending_question": None,
-        "pending_state":    pending_state,
-    }
-
+    # FIX (issue #40): update.message is None for an edited-message update
+    # (Telegram populates update.edited_message instead) -- reading
+    # update.message.text raised AttributeError BEFORE the try/except below
+    # even started, so editing a previous message produced total silence (no
+    # reply, and if the user was mid pending_state flow, that turn was
+    # dropped with zero feedback). update.effective_message resolves to
+    # whichever of message/edited_message/channel_post is actually set. The
+    # whole body is now inside the try/except too, not just the run_agent
+    # call, so ANY unexpected failure here still gets a reply instead of
+    # silence.
     try:
+        message = update.effective_message
+        user_input = message.text
+        chat_id    = update.effective_chat.id
+
+        if ALLOWED_CHAT_ID and str(chat_id) != str(ALLOWED_CHAT_ID):
+            logger.warning("Unauthorised access from chat %s", chat_id)
+            await message.reply_text("Sorry, you are not authorised to use this bot.")
+            return
+
+        logger.info("User %s: %s", chat_id, user_input)
+
+        pending_state = context.user_data.get("pending_state")
+
+        # BUG FIX #17: AgentState is a TypedDict — constructing it with all keys
+        # explicitly is the only safe way; any missing key causes a runtime error
+        # when langgraph reads it.  The original code was correct here but lacked
+        # the "intent" and "parsed_write" initialisations on some code paths.
+        # Ensured all seven keys are always present.
+        state: AgentState = {
+            "user_query":       user_input,
+            "intent":           None,
+            "parsed_write":     None,
+            "data_context":     data_context,
+            "final_answer":     "",
+            "pending_question": None,
+            "pending_state":    pending_state,
+        }
+
         result_state = run_agent(state)
 
         if result_state.get("pending_question"):
             context.user_data["pending_state"] = result_state["pending_state"]
-            await update.message.reply_text(result_state["pending_question"])
+            await message.reply_text(result_state["pending_question"])
         else:
             context.user_data.pop("pending_state", None)
             answer = result_state.get("final_answer", "")
@@ -153,13 +164,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             MAX_LEN = 4096
             if len(answer) > MAX_LEN:
                 for i in range(0, len(answer), MAX_LEN):
-                    await update.message.reply_text(answer[i : i + MAX_LEN])
+                    await message.reply_text(answer[i : i + MAX_LEN])
             else:
-                await update.message.reply_text(answer)
+                await message.reply_text(answer)
 
     except Exception as e:
         logger.exception("Agent error")
-        await update.message.reply_text(f"❌ An error occurred: {str(e)}")
+        try:
+            await update.effective_message.reply_text(f"❌ An error occurred: {str(e)}")
+        except Exception:
+            logger.exception("Also failed to send the error reply")
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
