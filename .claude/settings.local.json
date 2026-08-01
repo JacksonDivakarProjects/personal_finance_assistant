@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; [ast.parse\\(open\\(f, encoding='utf-8'\\).read\\(\\), f\\) for f in ['agent.py','data_loader.py']]\")",
+      "Bash(.venv/Scripts/python.exe -c ' *)"
+    ]
+  }
+}

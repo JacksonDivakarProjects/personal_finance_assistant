@@ -51,15 +51,14 @@ def _refresh_data_context(data_context: dict) -> None:
     if not sheet_client:
         return
     try:
-        expense_df       = load_expense_journal(sheet_client)
-        item_to_cat      = load_item_category(sheet_client)
-        budget_dict      = load_budget(sheet_client, "Category Budget")
-        next_budget_dict = load_budget(sheet_client, "Next Month Budget")
+        expense_df  = load_expense_journal(sheet_client)
+        item_to_cat = load_item_category(sheet_client)
+        budget_dict = load_budget(sheet_client, "Category Budget")
         actual_spend, total_actual = get_actual_spending(expense_df, item_to_cat)
+        # FIX (issue #27): "Next Month Budget" fallback removed — that
+        # worksheet no longer exists in the spreadsheet.
         for cat in actual_spend:
-            if cat not in budget_dict and cat in next_budget_dict:
-                budget_dict[cat] = next_budget_dict[cat]
-            elif cat not in budget_dict:
+            if cat not in budget_dict:
                 budget_dict[cat] = 0.0
         data_context["actual"]       = actual_spend
         data_context["budget"]       = budget_dict
@@ -168,11 +167,14 @@ def _extract_json(text: str) -> Optional[dict]:
 
 
 # ── Intent classification ─────────────────────────────────────────────────────
-def classify_intent(state: AgentState) -> AgentState:
-    if state.get("pending_state"):
-        state["intent"] = "write"
-        return state
-
+def _classify_intent_rule_based(state: AgentState) -> AgentState:
+    """
+    Keyword/regex fallback classifier. Used only when the LLM is unavailable
+    or its classification call fails/returns something unusable — this is the
+    pre-NLP behavior, kept as-is so the safety net doesn't drift from what was
+    already reviewed and fixed (issues #10 etc. live one layer down in
+    execute_write, not here).
+    """
     text = state["user_query"].lower().strip()
 
     query_indicators = [
@@ -197,19 +199,111 @@ def classify_intent(state: AgentState) -> AgentState:
         state["intent"] = "write"
         return state
 
-    greetings = ["hi", "hello", "hey", "good morning", "good evening", "how are you"]
-    if text in greetings or text.startswith(tuple(greetings)):
+    state["intent"] = "query"
+    return state
+
+
+def _classify_and_extract_via_llm(user_query: str) -> Optional[dict]:
+    """
+    Single combined Groq call: classify query-vs-write AND, for write intent,
+    extract the add_expense fields in the same response. Replaces the separate
+    keyword-list classification + a second LLM call in parse_write_intent with
+    one round trip, so real phrasing ("how much have I got left for rent",
+    "spent on lunch today") is understood by meaning instead of substring
+    matches.
+
+    Returns None (never raises) on ANY failure — network error, malformed
+    JSON, missing/invalid "intent" — so the caller can fall back to the
+    rule-based classifier without special-casing failure modes.
+    """
+    now = datetime.now()
+    prompt = (
+        'You are the intent classifier for a personal finance Telegram bot. '
+        'Classify the user message and return ONLY valid JSON.\n\n'
+        '"query" = the user is asking about their spending/budget/history '
+        '(e.g. "how much did I spend on X", "what\'s left for rent", "show my budget").\n'
+        '"write" = the user is reporting a new expense they made, to be logged '
+        '(e.g. "add coffee 250", "bought groceries for 500", "paid 100 for lunch").\n\n'
+        'If intent is "query", return: {"intent":"query"}\n'
+        'If intent is "write", return: {"intent":"write","operation":"add_expense",'
+        '"item":string,"amount":number,"day":int,"month":int,"year":int,"notes":string}\n'
+        f'Defaults for write if not stated: day={now.day}, month={now.month}, year={now.year}, notes="".\n'
+        f'Today: day={now.day}, month={now.month}, year={now.year}.\n'
+        f'User message: {user_query!r}\n'
+        'Example write: {"intent":"write","operation":"add_expense","item":"Coffee",'
+        '"amount":250,"day":15,"month":5,"year":2026,"notes":""}\n'
+        'Example query: {"intent":"query"}\n'
+        'Now output JSON:'
+    )
+
+    try:
+        response = llm.invoke(prompt).content.strip()
+    except Exception:
+        logger.exception("LLM intent-classification call failed")
+        return None
+
+    parsed = _extract_json(response)
+    if not isinstance(parsed, dict) or parsed.get("intent") not in ("query", "write"):
+        return None
+
+    if parsed["intent"] == "query":
+        return {"intent": "query"}
+
+    try:
+        parsed.setdefault("operation", "add_expense")
+        if not parsed.get("item"):
+            return None  # no safe way to proceed without an item name
+        parsed["item"] = str(parsed["item"])
+        m = re.search(r'\b(\d+(?:\.\d+)?)\b', user_query)
+        amount = parsed.get("amount")
+        parsed["amount"] = float(amount) if amount else (float(m.group(1)) if m else 0)
+        parsed["day"]    = int(parsed.get("day")   or now.day)
+        parsed["month"]  = int(parsed.get("month") or now.month)
+        parsed["year"]   = int(parsed.get("year")  or now.year)
+        parsed.setdefault("notes", "")
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    return {"intent": "write", "parsed": parsed}
+
+
+def classify_intent(state: AgentState) -> AgentState:
+    if state.get("pending_state"):
+        state["intent"] = "write"
+        return state
+
+    text = state["user_query"].lower().strip()
+
+    # Cheap deterministic short-circuit: no need to spend an LLM call on an
+    # unambiguous greeting.
+    greetings = ("hi", "hello", "hey", "good morning", "good evening", "how are you")
+    if text in greetings or text.startswith(greetings):
         state["intent"] = "query"
         return state
 
-    state["intent"] = "query"
-    return state
+    if llm is not None:
+        result = _classify_and_extract_via_llm(state["user_query"])
+        if result is not None:
+            state["intent"] = result["intent"]
+            if result["intent"] == "write":
+                # Extraction already done in the same LLM call — parse_write_intent
+                # will see this is already populated and skip its own LLM call.
+                state["parsed_write"] = result["parsed"]
+            return state
+        logger.warning("LLM intent classification unavailable/invalid; falling back to rule-based classifier")
+
+    return _classify_intent_rule_based(state)
 
 
 # ── Parse write intent ────────────────────────────────────────────────────────
 def parse_write_intent(state: AgentState) -> AgentState:
     if state.get("pending_state"):
         state["parsed_write"] = state["pending_state"].get("parsed", {})
+        return state
+
+    if state.get("parsed_write"):
+        # classify_intent's combined LLM call already extracted this — don't
+        # spend a second round trip re-parsing the same message.
         return state
 
     if llm is None:
@@ -348,7 +442,21 @@ def execute_write(state: AgentState) -> AgentState:  # noqa: C901
     if step == "amount":
         m = re.search(r'\b(\d+(?:\.\d+)?)\b', user_answer)
         if not m:
-            state["final_answer"] = "❌ Invalid amount. Please send a number, e.g., '150'."
+            # FIX (issue #26): this used to return a bare final_answer with no
+            # pending_state — since the top of this function already cleared
+            # pending_state/pending_question unconditionally, a non-numeric
+            # reply (or an unrelated message interrupting the flow) silently
+            # threw away the item/day/month/year the user already provided,
+            # forcing them to start the whole entry over. Re-ask for the
+            # amount and restore the exact pending_state instead, so the
+            # in-progress entry survives an invalid reply.
+            state["pending_question"] = (
+                f"❌ That doesn't look like an amount. How much did you spend on {item}? (e.g., 150)"
+            )
+            state["pending_state"] = {
+                "step": "amount", "parsed": parsed,
+                "item": item, "day": day, "month": month, "year": year, "notes": user_notes,
+            }
             return state
         amount = float(m.group(1))
         # falls through to shared category block below
@@ -507,8 +615,8 @@ def answer_query_node(state: AgentState) -> AgentState:
 
 
 # ── Routing & graph ───────────────────────────────────────────────────────────
-def route_intent(state: AgentState) -> Literal["execute_write", "answer_query"]:
-    return "execute_write" if state["intent"] == "write" else "answer_query"
+def route_intent(state: AgentState) -> Literal["write", "query"]:
+    return "write" if state["intent"] == "write" else "query"
 
 
 def build_graph(writer: DataWriter, sheet_client: SheetClient, data_context: dict):
@@ -522,11 +630,15 @@ def build_graph(writer: DataWriter, sheet_client: SheetClient, data_context: dic
     workflow.add_node("answer_query",    answer_query_node)
 
     workflow.set_entry_point("classify_intent")
-    workflow.add_edge("classify_intent", "parse_write")
+    # FIX (issue #25): route right after classify_intent instead of always
+    # running parse_write first — a pure query message no longer triggers a
+    # wasted second LLM call in parse_write_intent before being routed away
+    # from execute_write.
     workflow.add_conditional_edges(
-        "parse_write", route_intent,
-        {"execute_write": "execute_write", "answer_query": "answer_query"},
+        "classify_intent", route_intent,
+        {"write": "parse_write", "query": "answer_query"},
     )
+    workflow.add_edge("parse_write",   "execute_write")
     workflow.add_edge("execute_write", END)
     workflow.add_edge("answer_query",  END)
     compiled = workflow.compile()

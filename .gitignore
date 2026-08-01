@@ -1,0 +1,15 @@
+__pycache__/
+.env
+.venv
+account.json
+.*
+CLAUDE.md
+
+# Keep the subagents/skills built for this project under version control —
+# the ".*" pattern above would otherwise exclude them along with real dotfiles.
+!.claude/
+!.claude/**
+
+# The ".*" pattern above also self-matches this file — negate it so the
+# ignore rules themselves are actually shared via the repo, not local-only.
+!.gitignore

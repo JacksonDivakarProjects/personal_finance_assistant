@@ -32,17 +32,18 @@ if not TELEGRAM_TOKEN:
 # ----------------------------------------------------------------------
 sheet_client = SheetClient()
 
-expense_df      = load_expense_journal(sheet_client)
-item_to_cat     = load_item_category(sheet_client)
-budget_dict     = load_budget(sheet_client, "Category Budget")
-next_budget_dict = load_budget(sheet_client, "Next Month Budget")
+expense_df  = load_expense_journal(sheet_client)
+item_to_cat = load_item_category(sheet_client)
+budget_dict = load_budget(sheet_client, "Category Budget")
 
 actual_spend, total_actual = get_actual_spending(expense_df, item_to_cat)
 
+# FIX (issue #27): "Next Month Budget" fallback removed — that worksheet no
+# longer exists in the spreadsheet. A category with no "Category Budget" row
+# now just defaults to 0.0 budgeted, same as before for any category missing
+# from both sheets.
 for cat in actual_spend:
-    if cat not in budget_dict and cat in next_budget_dict:
-        budget_dict[cat] = next_budget_dict[cat]
-    elif cat not in budget_dict:
+    if cat not in budget_dict:
         budget_dict[cat] = 0.0
 
 data_context = {
