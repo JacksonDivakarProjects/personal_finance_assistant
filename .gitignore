@@ -14,6 +14,7 @@ bot_persistence.pickle
 # the ".*" pattern above would otherwise exclude them along with real dotfiles.
 !.claude/
 !.claude/**
+!.env.example
 
 # The ".*" pattern above also self-matches this file — negate it so the
 # ignore rules themselves are actually shared via the repo, not local-only.
