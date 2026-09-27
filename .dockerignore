@@ -5,3 +5,6 @@ __pycache__
 .env
 account.json
 *.log
+# Runtime conversation state (issue #42) -- never bake into a pushed image.
+bot_persistence.pickle
+data/

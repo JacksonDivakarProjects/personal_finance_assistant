@@ -7,8 +7,9 @@ WORKDIR /app
 # Copy requirements first (for better layer caching)
 COPY requirements.txt .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python dependencies (longer timeout/retries: default 15s read
+# timeout fails the build on a slow link to PyPI)
+RUN pip install --no-cache-dir --default-timeout=120 --retries 10 -r requirements.txt
 
 # Copy the rest of the application
 COPY . .
